@@ -394,6 +394,22 @@ def source_answer_match_score(message: Message, wait: PendingWait) -> int:
     return score
 
 
+def quoted_source_match_score(reply_message: Message, wait: PendingWait) -> int:
+    replied_text = normalized_message_text(reply_message)
+    if not replied_text:
+        return 0
+
+    replied_tokens = important_tokens(replied_text)
+    source_tokens = important_tokens(wait.source_quote)
+    shared_tokens = replied_tokens & source_tokens
+    if not shared_tokens:
+        return 0
+
+    score = len(shared_tokens)
+    score += sum(2 for token in shared_tokens if any(char.isdigit() for char in token))
+    return score
+
+
 def group_waits_by_source(waits: list[PendingWait]) -> list[list[PendingWait]]:
     groups: dict[int, list[PendingWait]] = {}
     for wait in waits:
@@ -410,6 +426,50 @@ def select_waits_answered_by_message(waits: list[PendingWait], message: Message)
     for group in source_groups:
         score = max(source_answer_match_score(message, wait) for wait in group)
         if score > 0:
+            scored_groups.append((score, group))
+
+    if not scored_groups:
+        return []
+
+    best_score = max(score for score, _ in scored_groups)
+    best_groups = [group for score, group in scored_groups if score == best_score]
+    if len(best_groups) == 1:
+        return best_groups[0]
+    return []
+
+
+async def active_waits_for_reply(
+    app_storage: Storage,
+    message: Message,
+) -> list[PendingWait]:
+    reply = message.reply_to_message
+    if not reply:
+        return []
+
+    by_source = await app_storage.active_waits_for_source_message(
+        chat_id=message.chat.id,
+        source_message_id=reply.message_id,
+    )
+    if by_source:
+        return by_source
+
+    by_reminder = await app_storage.active_waits_for_reminder_message(
+        chat_id=message.chat.id,
+        reminder_message_id=reply.message_id,
+    )
+    if by_reminder:
+        source_message_ids = [wait.source_message_id for wait in by_reminder]
+        source_waits = await app_storage.active_waits_for_source_messages(
+            chat_id=message.chat.id,
+            source_message_ids=source_message_ids,
+        )
+        return source_waits or by_reminder
+
+    active_waits = await app_storage.active_waits_in_chat(chat_id=message.chat.id)
+    scored_groups: list[tuple[int, list[PendingWait]]] = []
+    for group in group_waits_by_source(active_waits):
+        score = max(quoted_source_match_score(reply, wait) for wait in group)
+        if score >= 2:
             scored_groups.append((score, group))
 
     if not scored_groups:
@@ -1040,10 +1100,7 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     )
     reply_source_waits: list[PendingWait] = []
     if message.reply_to_message:
-        reply_source_waits = await app_storage.active_waits_for_source_message(
-            chat_id=message.chat.id,
-            source_message_id=message.reply_to_message.message_id,
-        )
+        reply_source_waits = await active_waits_for_reply(app_storage, message)
 
     if reply_source_waits and mention_targets:
         await close_waits_after_employee_message(

@@ -51,7 +51,7 @@ def load_settings() -> Settings:
         workday_start=_parse_hhmm(env.str("WORKDAY_START", "09:30")),
         workday_end=_parse_hhmm(env.str("WORKDAY_END", "19:00")),
         daily_report_time=_parse_hhmm(env.str("DAILY_REPORT_TIME", "09:30")),
-        reminder_interval_minutes=env.int("REMINDER_INTERVAL_MINUTES", 20),
+        reminder_interval_minutes=env.int("REMINDER_INTERVAL_MINUTES", 15),
         direct_message_after_minutes=env.int("DIRECT_MESSAGE_AFTER_MINUTES", 60),
         leader_username=env.str("LEADER_USERNAME", "Fedos_AV").removeprefix("@").lower(),
         escalate_after_reminders=env.int("ESCALATE_AFTER_REMINDERS", 3),

@@ -551,6 +551,26 @@ class Storage:
         row = await cursor.fetchone()
         return self._pending_wait(row) if row else None
 
+    async def active_waits_for_reminder_message(
+        self,
+        *,
+        chat_id: int,
+        reminder_message_id: int,
+    ) -> list[PendingWait]:
+        cursor = await self.conn.execute(
+            """
+            SELECT *
+            FROM waits
+            WHERE status = 'active'
+              AND chat_id = ?
+              AND last_reminder_message_id = ?
+            ORDER BY id
+            """,
+            (chat_id, reminder_message_id),
+        )
+        rows = await cursor.fetchall()
+        return [self._pending_wait(row) for row in rows]
+
     async def due_waits(self, now: datetime) -> list[PendingWait]:
         cursor = await self.conn.execute(
             """
