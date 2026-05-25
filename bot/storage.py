@@ -111,8 +111,9 @@ class Storage:
                 closed_by_user_id INTEGER
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_waits_one_active_per_user_chat
-                ON waits(chat_id, username_lower)
+            DROP INDEX IF EXISTS idx_waits_one_active_per_user_chat;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_waits_one_active_per_user_source
+                ON waits(chat_id, username_lower, source_message_id)
                 WHERE status = 'active';
             CREATE INDEX IF NOT EXISTS idx_waits_due
                 ON waits(status, next_reminder_at, direct_message_due_at);
@@ -265,6 +266,19 @@ class Storage:
         )
         return await cursor.fetchone()
 
+    async def known_users_for_matching(self) -> list[aiosqlite.Row]:
+        cursor = await self.conn.execute(
+            """
+            SELECT *
+            FROM known_users
+            WHERE username_lower IS NOT NULL
+               OR first_name IS NOT NULL
+               OR last_name IS NOT NULL
+            ORDER BY updated_at DESC
+            """
+        )
+        return await cursor.fetchall()
+
     async def upsert_wait(
         self,
         *,
@@ -289,21 +303,14 @@ class Storage:
                 created_at, updated_at, next_reminder_at, direct_message_due_at
             )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(chat_id, username_lower) WHERE status = 'active' DO UPDATE SET
+            ON CONFLICT(chat_id, username_lower, source_message_id) WHERE status = 'active' DO UPDATE SET
                 chat_title=excluded.chat_title,
                 display_name=excluded.display_name,
                 user_id=coalesce(excluded.user_id, waits.user_id),
-                source_message_id=excluded.source_message_id,
                 source_message_link=excluded.source_message_link,
                 source_quote=excluded.source_quote,
                 mentioned_by_user_id=excluded.mentioned_by_user_id,
-                updated_at=excluded.updated_at,
-                next_reminder_at=excluded.next_reminder_at,
-                direct_message_due_at=excluded.direct_message_due_at,
-                direct_message_attempted_at=NULL,
-                direct_message_sent_at=NULL,
-                group_reminders_stopped_at=NULL,
-                reminder_count=0
+                updated_at=excluded.updated_at
             """,
             (
                 chat_id,
@@ -362,6 +369,20 @@ class Storage:
               AND ({" OR ".join(clauses)})
             """,
             (chat_id, *params),
+        )
+        rows = await cursor.fetchall()
+        return [self._pending_wait(row) for row in rows]
+
+    async def active_waits_in_chat(self, *, chat_id: int) -> list[PendingWait]:
+        cursor = await self.conn.execute(
+            """
+            SELECT *
+            FROM waits
+            WHERE status = 'active'
+              AND chat_id = ?
+            ORDER BY created_at, id
+            """,
+            (chat_id,),
         )
         rows = await cursor.fetchall()
         return [self._pending_wait(row) for row in rows]

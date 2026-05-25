@@ -137,6 +137,125 @@ def normalized_message_text(message: Message) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def normalized_match_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("ё", "е").casefold()).strip()
+
+
+def text_contains_standalone_name(text: str, name: str) -> bool:
+    normalized_text = normalized_match_text(text)
+    normalized_name = normalized_match_text(name)
+    if len(normalized_name) < 3:
+        return False
+    pattern = rf"(?<![\w@]){re.escape(normalized_name)}(?![\w@])"
+    return re.search(pattern, normalized_text) is not None
+
+
+def mention_target_from_known_user(user: object, display_name: str) -> MentionTarget:
+    username = user["username_lower"] if user["username_lower"] else None
+    return MentionTarget(
+        identity=username or f"user_id:{user['user_id']}",
+        display_name=display_name,
+        username=username,
+        user_id=user["user_id"],
+        first_name=user["first_name"],
+        last_name=user["last_name"],
+    )
+
+
+def add_mention_target(
+    targets: dict[str, MentionTarget],
+    target: MentionTarget,
+    *,
+    sender_id: int | None,
+    sender_username: str | None,
+) -> None:
+    if sender_id is not None and target.user_id == sender_id:
+        return
+    if sender_username is not None and target.identity == sender_username:
+        return
+    targets.setdefault(target.identity, target)
+
+
+async def extend_targets_from_known_names(
+    app_storage: Storage,
+    message: Message,
+    targets: list[MentionTarget],
+) -> list[MentionTarget]:
+    text = normalized_message_text(message)
+    if not text:
+        return targets
+
+    sender_id = message.from_user.id if message.from_user else None
+    sender_username = message.from_user.username.lower() if message.from_user and message.from_user.username else None
+    targets_by_identity = {target.identity: target for target in targets}
+
+    known_users = await app_storage.known_users_for_matching()
+    first_name_counts: dict[str, int] = {}
+    for user in known_users:
+        first_name = user["first_name"]
+        if not first_name:
+            continue
+        normalized_first_name = normalized_match_text(first_name)
+        if len(normalized_first_name) >= 3:
+            first_name_counts[normalized_first_name] = first_name_counts.get(normalized_first_name, 0) + 1
+
+    for user in known_users:
+        first_name = user["first_name"]
+        last_name = user["last_name"]
+        full_name = " ".join(part for part in (first_name, last_name) if part).strip()
+        matched_label: str | None = None
+
+        if full_name and text_contains_standalone_name(text, full_name):
+            matched_label = full_name
+        elif first_name:
+            normalized_first_name = normalized_match_text(first_name)
+            if first_name_counts.get(normalized_first_name) == 1 and text_contains_standalone_name(text, first_name):
+                matched_label = first_name
+
+        if not matched_label and user["username_lower"] and text_contains_standalone_name(text, user["username_lower"]):
+            matched_label = display_username(user["username_lower"])
+
+        if matched_label:
+            add_mention_target(
+                targets_by_identity,
+                mention_target_from_known_user(user, matched_label),
+                sender_id=sender_id,
+                sender_username=sender_username,
+            )
+
+    active_waits = await app_storage.active_waits_in_chat(chat_id=message.chat.id)
+    for wait in active_waits:
+        labels = [wait.display_name] if wait.display_name else []
+        if not wait.username.startswith("user_id:"):
+            labels.append(wait.username)
+
+        matched_label = next(
+            (
+                label
+                for label in labels
+                if label and not label.startswith("@") and text_contains_standalone_name(text, label)
+            ),
+            None,
+        )
+        if not matched_label:
+            continue
+
+        username = wait.username if not wait.username.startswith("user_id:") else None
+        add_mention_target(
+            targets_by_identity,
+            MentionTarget(
+                identity=wait.username,
+                display_name=matched_label,
+                username=username,
+                user_id=wait.user_id,
+            ),
+            sender_id=sender_id,
+            sender_username=sender_username,
+        )
+
+    return sorted(targets_by_identity.values(), key=lambda target: target.display_name.lower())
+
+
 def is_unclear_employee_response(message: Message) -> bool:
     text = normalized_message_text(message)
     if not text:
@@ -166,6 +285,141 @@ def is_meaningful_employee_response(message: Message) -> bool:
     if not text:
         return bool(message.photo or message.document or message.video or message.voice or message.audio)
     return not is_unclear_employee_response(message)
+
+
+SOURCE_MATCH_STOPWORDS = {
+    "если",
+    "или",
+    "как",
+    "когда",
+    "который",
+    "которая",
+    "которые",
+    "нужен",
+    "нужна",
+    "нужно",
+    "нужны",
+    "ответ",
+    "пожалуйста",
+    "сегодня",
+    "сообщение",
+    "сообщению",
+    "через",
+    "что",
+    "это",
+    "этот",
+    "этому",
+    "есть",
+    "будет",
+    "будут",
+    "надо",
+    "еще",
+    "ещё",
+}
+
+
+RUSSIAN_MATCH_ENDINGS = (
+    "ами",
+    "ями",
+    "ого",
+    "ему",
+    "ыми",
+    "ими",
+    "ых",
+    "их",
+    "ую",
+    "юю",
+    "ая",
+    "яя",
+    "ое",
+    "ее",
+    "ые",
+    "ие",
+    "ой",
+    "ей",
+    "ом",
+    "ем",
+    "ам",
+    "ям",
+    "ах",
+    "ях",
+    "ку",
+    "ке",
+    "ка",
+    "ки",
+    "ый",
+    "ий",
+)
+
+
+def token_match_forms(token: str) -> set[str]:
+    forms = {token}
+    if not re.fullmatch(r"[а-я]+", token) or len(token) < 6:
+        return forms
+
+    forms.add(token[:-1])
+    for ending in RUSSIAN_MATCH_ENDINGS:
+        if token.endswith(ending) and len(token) - len(ending) >= 4:
+            forms.add(token[: -len(ending)])
+    return forms
+
+
+def important_tokens(value: str) -> set[str]:
+    normalized = normalized_match_text(value)
+    tokens = re.findall(r"[0-9a-zа-я_]+", normalized)
+    result: set[str] = set()
+    for token in tokens:
+        if token in SOURCE_MATCH_STOPWORDS:
+            continue
+        if token.isdigit() and len(token) >= 3:
+            result.add(token)
+        elif len(token) >= 4:
+            result.update(token_match_forms(token))
+    return result
+
+
+def source_answer_match_score(message: Message, wait: PendingWait) -> int:
+    text = normalized_message_text(message)
+    if not text:
+        return 0
+
+    response_tokens = important_tokens(text)
+    source_tokens = important_tokens(wait.source_quote)
+    shared_tokens = response_tokens & source_tokens
+    if not shared_tokens:
+        return 0
+
+    score = len(shared_tokens)
+    score += sum(2 for token in shared_tokens if any(char.isdigit() for char in token))
+    return score
+
+
+def group_waits_by_source(waits: list[PendingWait]) -> list[list[PendingWait]]:
+    groups: dict[int, list[PendingWait]] = {}
+    for wait in waits:
+        groups.setdefault(wait.source_message_id, []).append(wait)
+    return [sorted(group, key=lambda item: item.id) for group in groups.values()]
+
+
+def select_waits_answered_by_message(waits: list[PendingWait], message: Message) -> list[PendingWait]:
+    source_groups = group_waits_by_source(waits)
+    if len(source_groups) == 1:
+        return source_groups[0]
+
+    scored_groups: list[tuple[int, list[PendingWait]]] = []
+    for group in source_groups:
+        score = max(source_answer_match_score(message, wait) for wait in group)
+        if score > 0:
+            scored_groups.append((score, group))
+
+    if not scored_groups:
+        return []
+
+    best_score = max(score for score, _ in scored_groups)
+    best_groups = [group for score, group in scored_groups if score == best_score]
+    if len(best_groups) == 1:
+        return best_groups[0]
+    return []
 
 
 def is_direct_message_unreachable(wait: PendingWait) -> bool:
@@ -538,7 +792,7 @@ async def start_private(message: Message, app_storage: Storage, settings: Settin
     await message.answer(
         "Готово. Теперь бот знает ваш Telegram user_id и сможет отправить личное "
         "напоминание, если вас ждут в рабочем чате.\n\n"
-        "В группе я буду закрывать ожидания автоматически, когда вы напишете любое сообщение. "
+        "В группе я буду закрывать ожидания автоматически, когда ответ понятен или привязан к исходному сообщению. "
         "Кнопками в напоминаниях может пользоваться любой участник чата, а я зафиксирую, кто нажал."
         f"{leader_note}"
     )
@@ -565,6 +819,7 @@ async def stats_command(message: Message, app_storage: Storage, settings: Settin
                 f"Закрыто подтверждением: {summary.get('wait_closed_by_confirm_button', 0)}",
                 f"Отложено кнопкой: {summary.get('wait_snoozed_by_button', 0)}",
                 f"Спорных ответов: {summary.get('wait_response_unclear', 0)}",
+                f"Неоднозначных ответов: {summary.get('wait_response_ambiguous', 0)}",
                 f"Оставлено под контролем: {summary.get('wait_kept_by_confirm_button', 0)}",
                 f"Переадресовано: {summary.get('wait_delegated', 0)}",
                 f"Групповых напоминаний: {summary.get('group_reminder_sent', 0)}",
@@ -727,6 +982,35 @@ async def create_delegated_waits(
         logger.info("Delegated wait from user %s to %s in chat %s", sender_id, target.identity, message.chat.id)
 
 
+async def ask_to_confirm_response(
+    app_storage: Storage,
+    message: Message,
+    waits: list[PendingWait],
+    now: datetime,
+    *,
+    metric_name: str,
+) -> None:
+    for source_waits in group_waits_by_source(waits):
+        wait = source_waits[0]
+        await message.reply(
+            (
+                f"{wait_targets_label(source_waits)}, считать это ответом по сообщению: "
+                f"{source_reference(wait.source_message_link, wait.source_quote)}"
+            ),
+            disable_web_page_preview=True,
+            parse_mode="HTML",
+            reply_markup=answer_confirmation_keyboard(wait),
+        )
+        for source_wait in source_waits:
+            await app_storage.record_metric(
+                metric_name,
+                now=now,
+                chat_id=message.chat.id,
+                username_lower=source_wait.username,
+                wait_id=source_wait.id,
+            )
+
+
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
 async def handle_group_message(message: Message, bot: Bot, app_storage: Storage, settings: Settings) -> None:
     await register_user_from_message(app_storage, message, settings)
@@ -735,9 +1019,14 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     sender_username = message.from_user.username.lower() if message.from_user and message.from_user.username else None
     sender_id = message.from_user.id if message.from_user else None
 
+    detected_targets = await extend_targets_from_known_names(
+        app_storage,
+        message,
+        extract_mention_targets(message),
+    )
     mention_targets = [
         target
-        for target in extract_mention_targets(message)
+        for target in detected_targets
         if not (
             (sender_id is not None and target.user_id == sender_id)
             or (sender_username is not None and target.identity == sender_username)
@@ -755,26 +1044,6 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
             chat_id=message.chat.id,
             source_message_id=message.reply_to_message.message_id,
         )
-
-    if sender_waits and mention_targets:
-        await close_waits_after_employee_message(
-            bot,
-            app_storage,
-            message,
-            sender_waits,
-            now,
-            metric_name="wait_delegated_from_message",
-            reason="переадресовал вопрос",
-        )
-        await create_delegated_waits(
-            app_storage,
-            message,
-            settings,
-            mention_targets,
-            now,
-            source_waits_count=len(sender_waits),
-        )
-        return
 
     if reply_source_waits and mention_targets:
         await close_waits_after_employee_message(
@@ -796,6 +1065,40 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         )
         return
 
+    if sender_waits and mention_targets:
+        delegated_waits = select_waits_answered_by_message(sender_waits, message)
+        if delegated_waits:
+            await close_waits_after_employee_message(
+                bot,
+                app_storage,
+                message,
+                delegated_waits,
+                now,
+                metric_name="wait_delegated_from_message",
+                reason="переадресовал вопрос",
+            )
+            await create_delegated_waits(
+                app_storage,
+                message,
+                settings,
+                mention_targets,
+                now,
+                source_waits_count=len(delegated_waits),
+            )
+            return
+
+        for target in mention_targets:
+            await create_wait_for_target(
+                app_storage,
+                message,
+                settings,
+                target=target,
+                now=now,
+                source_prefix=None,
+            )
+            logger.info("Created wait for %s in chat %s; sender waits left active", target.identity, message.chat.id)
+        return
+
     if reply_source_waits and is_meaningful_employee_response(message):
         await close_waits_after_employee_message(
             bot,
@@ -809,35 +1112,36 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         return
 
     if sender_waits and is_meaningful_employee_response(message):
-        await close_waits_after_employee_message(
-            bot,
+        answered_waits = select_waits_answered_by_message(sender_waits, message)
+        if answered_waits:
+            await close_waits_after_employee_message(
+                bot,
+                app_storage,
+                message,
+                answered_waits,
+                now,
+                metric_name="wait_closed_by_message",
+                reason="ответил",
+            )
+            return
+
+        await ask_to_confirm_response(
             app_storage,
             message,
             sender_waits,
             now,
-            metric_name="wait_closed_by_message",
-            reason="ответил",
+            metric_name="wait_response_ambiguous",
         )
         return
 
     if sender_waits:
-        for wait in sender_waits:
-            await message.reply(
-                (
-                    f"{wait_target_label(wait)}, считать это ответом по сообщению: "
-                    f"{source_reference(wait.source_message_link, wait.source_quote)}"
-                ),
-                disable_web_page_preview=True,
-                parse_mode="HTML",
-                reply_markup=answer_confirmation_keyboard(wait),
-            )
-            await app_storage.record_metric(
-                "wait_response_unclear",
-                now=now,
-                chat_id=message.chat.id,
-                username_lower=wait.username,
-                wait_id=wait.id,
-            )
+        await ask_to_confirm_response(
+            app_storage,
+            message,
+            sender_waits,
+            now,
+            metric_name="wait_response_unclear",
+        )
         return
 
     if not mention_targets:

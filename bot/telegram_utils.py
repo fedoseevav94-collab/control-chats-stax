@@ -60,6 +60,17 @@ def extract_mention_targets(message: Message) -> list[MentionTarget]:
                 first_name=user.first_name,
                 last_name=user.last_name,
             )
+        elif entity.type == MessageEntityType.TEXT_LINK and entity.url:
+            match = re.fullmatch(r"tg://user\?id=(\d+)", entity.url)
+            if match:
+                user_id = int(match.group(1))
+                display_name = entity.extract_from(text) or f"user_id:{user_id}"
+                identity = f"user_id:{user_id}"
+                targets[identity] = MentionTarget(
+                    identity=identity,
+                    display_name=display_name,
+                    user_id=user_id,
+                )
 
     for match in USERNAME_RE.finditer(text):
         username = normalize_username(match.group(1))
