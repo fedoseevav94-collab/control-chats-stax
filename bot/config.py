@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from datetime import time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+from environs import Env
+
+
+def _parse_hhmm(value: str) -> time:
+    hours, minutes = value.split(":", maxsplit=1)
+    return time(hour=int(hours), minute=int(minutes))
+
+
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    timezone_name: str
+    timezone: ZoneInfo
+    workday_start: time
+    workday_end: time
+    daily_report_time: time
+    reminder_interval_minutes: int
+    direct_message_after_minutes: int
+    leader_username: str
+    escalate_after_reminders: int
+    max_group_reminders_if_dm_unreachable: int
+    database_path: Path
+    scheduler_tick_seconds: int = 30
+    scheduler_startup_grace_seconds: int = 45
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("BOT_TOKEN не найден")
+
+    env = Env()
+    env.read_env()
+
+    timezone_name = env.str("TIMEZONE", "Europe/Moscow")
+    return Settings(
+        bot_token=bot_token,
+        timezone_name=timezone_name,
+        timezone=ZoneInfo(timezone_name),
+        workday_start=_parse_hhmm(env.str("WORKDAY_START", "09:30")),
+        workday_end=_parse_hhmm(env.str("WORKDAY_END", "19:00")),
+        daily_report_time=_parse_hhmm(env.str("DAILY_REPORT_TIME", "09:30")),
+        reminder_interval_minutes=env.int("REMINDER_INTERVAL_MINUTES", 20),
+        direct_message_after_minutes=env.int("DIRECT_MESSAGE_AFTER_MINUTES", 60),
+        leader_username=env.str("LEADER_USERNAME", "Fedos_AV").removeprefix("@").lower(),
+        escalate_after_reminders=env.int("ESCALATE_AFTER_REMINDERS", 3),
+        max_group_reminders_if_dm_unreachable=env.int("MAX_GROUP_REMINDERS_IF_DM_UNREACHABLE", 3),
+        database_path=Path(env.str("DATABASE_PATH", "bot.sqlite3")),
+        scheduler_tick_seconds=env.int("SCHEDULER_TICK_SECONDS", 30),
+        scheduler_startup_grace_seconds=env.int("SCHEDULER_STARTUP_GRACE_SECONDS", 45),
+    )
