@@ -893,6 +893,29 @@ async def stats_command(message: Message, app_storage: Storage, settings: Settin
     )
 
 
+@router.message(Command("settings"))
+async def settings_command(message: Message, app_storage: Storage, settings: Settings) -> None:
+    await register_user_from_message(app_storage, message, settings)
+    if not is_leader(message.from_user, settings):
+        await message.answer("Настройки доступны только руководителю.")
+        return
+
+    await message.answer(
+        "\n".join(
+            [
+                "Текущие настройки бота:",
+                f"Интервал напоминаний: {settings.reminder_interval_minutes} мин.",
+                f"Личное сообщение через: {settings.direct_message_after_minutes} мин.",
+                f"Рабочее время: {settings.workday_start.strftime('%H:%M')} - {settings.workday_end.strftime('%H:%M')}",
+                f"Часовой пояс: {settings.timezone_name}",
+                f"Отчёт каждый день: {settings.daily_report_time.strftime('%H:%M')}",
+                f"Руководитель: {display_username(settings.leader_username)}",
+                f"База данных: {settings.database_path}",
+            ]
+        )
+    )
+
+
 @router.message(Command("chatid"))
 async def chat_id_command(message: Message, app_storage: Storage, settings: Settings) -> None:
     await register_user_from_message(app_storage, message, settings)
@@ -1704,6 +1727,14 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings = load_settings()
+    logger.info(
+        "Settings loaded: reminder_interval=%s min, direct_message_after=%s min, workday=%s-%s, timezone=%s",
+        settings.reminder_interval_minutes,
+        settings.direct_message_after_minutes,
+        settings.workday_start.strftime("%H:%M"),
+        settings.workday_end.strftime("%H:%M"),
+        settings.timezone_name,
+    )
     storage = Storage(str(settings.database_path))
     await storage.connect()
 
