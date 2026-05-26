@@ -223,6 +223,59 @@ def text_contains_standalone_name(text: str, name: str) -> bool:
     return re.search(pattern, normalized_text) is not None
 
 
+def user_display_labels(user: User | None) -> set[str]:
+    if not user:
+        return set()
+
+    labels: set[str] = set()
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
+    if full_name:
+        labels.add(normalized_match_text(full_name))
+    if user.first_name and not user.last_name:
+        labels.add(normalized_match_text(user.first_name))
+    if user.username:
+        labels.add(normalized_match_text(user.username))
+        labels.add(normalized_match_text(f"@{user.username}"))
+    return {label for label in labels if len(label) >= 3}
+
+
+def wait_matches_sender_display(wait: PendingWait, user: User | None) -> bool:
+    if not user or not wait.display_name:
+        return False
+    if wait.user_id is not None and wait.user_id != user.id:
+        return False
+
+    wait_label = normalized_match_text(wait.display_name)
+    if not wait_label or wait_label.startswith("@"):
+        return False
+    return wait_label in user_display_labels(user)
+
+
+def wait_matches_telegram_user(wait: PendingWait, user: User | None) -> bool:
+    if not user:
+        return False
+    if wait.user_id is not None:
+        return wait.user_id == user.id
+
+    username = user.username.lower() if user.username else None
+    if username and wait.username == username:
+        return True
+
+    return wait_matches_sender_display(wait, user)
+
+
+async def resolve_user_id_for_matching_waits(
+    app_storage: Storage,
+    waits: list[PendingWait],
+    user: User | None,
+) -> None:
+    if not user:
+        return
+    for wait in waits:
+        if wait.user_id is None and wait_matches_telegram_user(wait, user):
+            await app_storage.resolve_user_id_for_wait(wait.id, user.id)
+
+
 def mention_target_from_known_user(user: object, display_name: str) -> MentionTarget:
     username = user["username_lower"] if user["username_lower"] else None
     return MentionTarget(
@@ -451,8 +504,7 @@ def important_tokens(value: str) -> set[str]:
     return result
 
 
-def source_answer_match_score(message: Message, wait: PendingWait) -> int:
-    text = normalized_message_text(message)
+def source_text_match_score(text: str, wait: PendingWait) -> int:
     if not text:
         return 0
 
@@ -467,20 +519,12 @@ def source_answer_match_score(message: Message, wait: PendingWait) -> int:
     return score
 
 
+def source_answer_match_score(message: Message, wait: PendingWait) -> int:
+    return source_text_match_score(normalized_message_text(message), wait)
+
+
 def quoted_source_match_score(reply_message: Message, wait: PendingWait) -> int:
-    replied_text = normalized_message_text(reply_message)
-    if not replied_text:
-        return 0
-
-    replied_tokens = important_tokens(replied_text)
-    source_tokens = important_tokens(wait.source_quote)
-    shared_tokens = replied_tokens & source_tokens
-    if not shared_tokens:
-        return 0
-
-    score = len(shared_tokens)
-    score += sum(2 for token in shared_tokens if any(char.isdigit() for char in token))
-    return score
+    return source_text_match_score(normalized_message_text(reply_message), wait)
 
 
 def group_waits_by_source(waits: list[PendingWait]) -> list[list[PendingWait]]:
@@ -511,38 +555,21 @@ def select_waits_answered_by_message(waits: list[PendingWait], message: Message)
     return []
 
 
-async def active_waits_for_reply(
+async def active_waits_matching_source_text(
     app_storage: Storage,
-    message: Message,
+    *,
+    chat_id: int,
+    text: str,
+    min_score: int = 2,
 ) -> list[PendingWait]:
-    reply = message.reply_to_message
-    if not reply:
+    if not text:
         return []
 
-    by_source = await app_storage.active_waits_for_source_message(
-        chat_id=message.chat.id,
-        source_message_id=reply.message_id,
-    )
-    if by_source:
-        return by_source
-
-    by_reminder = await app_storage.active_waits_for_reminder_message(
-        chat_id=message.chat.id,
-        reminder_message_id=reply.message_id,
-    )
-    if by_reminder:
-        source_message_ids = [wait.source_message_id for wait in by_reminder]
-        source_waits = await app_storage.active_waits_for_source_messages(
-            chat_id=message.chat.id,
-            source_message_ids=source_message_ids,
-        )
-        return source_waits or by_reminder
-
-    active_waits = await app_storage.active_waits_in_chat(chat_id=message.chat.id)
+    active_waits = await app_storage.active_waits_in_chat(chat_id=chat_id)
     scored_groups: list[tuple[int, list[PendingWait]]] = []
     for group in group_waits_by_source(active_waits):
-        score = max(quoted_source_match_score(reply, wait) for wait in group)
-        if score >= 2:
+        score = max(source_text_match_score(text, wait) for wait in group)
+        if score >= min_score:
             scored_groups.append((score, group))
 
     if not scored_groups:
@@ -553,6 +580,96 @@ async def active_waits_for_reply(
     if len(best_groups) == 1:
         return best_groups[0]
     return []
+
+
+async def active_waits_for_reply(
+    app_storage: Storage,
+    message: Message,
+) -> list[PendingWait]:
+    reply = message.reply_to_message
+    if reply:
+        by_source = await app_storage.active_waits_for_source_message(
+            chat_id=message.chat.id,
+            source_message_id=reply.message_id,
+        )
+        if by_source:
+            return by_source
+
+        by_reminder = await app_storage.active_waits_for_reminder_message(
+            chat_id=message.chat.id,
+            reminder_message_id=reply.message_id,
+        )
+        if by_reminder:
+            source_message_ids = [wait.source_message_id for wait in by_reminder]
+            source_waits = await app_storage.active_waits_for_source_messages(
+                chat_id=message.chat.id,
+                source_message_ids=source_message_ids,
+            )
+            return source_waits or by_reminder
+
+        by_replied_text = await active_waits_matching_source_text(
+            app_storage,
+            chat_id=message.chat.id,
+            text=normalized_message_text(reply),
+        )
+        if by_replied_text:
+            return by_replied_text
+
+    external_reply = getattr(message, "external_reply", None)
+    external_chat = getattr(external_reply, "chat", None) if external_reply else None
+    external_message_id = getattr(external_reply, "message_id", None) if external_reply else None
+    external_chat_id = getattr(external_chat, "id", None) if external_chat else None
+    if external_message_id and external_chat_id == message.chat.id:
+        by_external_source = await app_storage.active_waits_for_source_message(
+            chat_id=message.chat.id,
+            source_message_id=external_message_id,
+        )
+        if by_external_source:
+            return by_external_source
+
+    quote = getattr(message, "quote", None)
+    quote_text = getattr(quote, "text", None) if quote else None
+    if quote_text:
+        by_quote = await active_waits_matching_source_text(
+            app_storage,
+            chat_id=message.chat.id,
+            text=quote_text,
+        )
+        if by_quote:
+            return by_quote
+
+    return []
+
+
+async def active_waits_for_sender(
+    app_storage: Storage,
+    message: Message,
+    *,
+    user_id: int | None,
+    username_lower: str | None,
+) -> list[PendingWait]:
+    waits = await app_storage.active_waits_for_user(
+        chat_id=message.chat.id,
+        user_id=user_id,
+        username_lower=username_lower,
+    )
+    seen_ids = {wait.id for wait in waits}
+
+    if not message.from_user:
+        return waits
+
+    active_waits = await app_storage.active_waits_in_chat(chat_id=message.chat.id)
+    for wait in active_waits:
+        if wait.id in seen_ids:
+            continue
+        if not wait_matches_sender_display(wait, message.from_user):
+            continue
+        if user_id is not None and wait.user_id is None:
+            await app_storage.resolve_user_id_for_wait(wait.id, user_id)
+        waits.append(wait)
+        seen_ids.add(wait.id)
+
+    return sorted(waits, key=lambda wait: wait.id)
 
 
 def is_direct_message_unreachable(wait: PendingWait) -> bool:
@@ -1343,8 +1460,9 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         )
     ]
 
-    sender_waits = await app_storage.active_waits_for_user(
-        chat_id=message.chat.id,
+    sender_waits = await active_waits_for_sender(
+        app_storage,
+        message,
         user_id=sender_id,
         username_lower=sender_username,
     )
@@ -1491,26 +1609,35 @@ async def handle_message_reaction(
         source_message_id=event.message_id,
     )
     if not waits:
+        reminder_waits = await app_storage.active_waits_for_reminder_message(
+            chat_id=event.chat.id,
+            reminder_message_id=event.message_id,
+        )
+        if reminder_waits:
+            waits = await app_storage.active_waits_for_source_messages(
+                chat_id=event.chat.id,
+                source_message_ids=[wait.source_message_id for wait in reminder_waits],
+            ) or reminder_waits
+
+    if not waits:
         return
 
-    username = event.user.username.lower() if event.user.username else None
-    is_addressee = any(
-        (wait.user_id is not None and wait.user_id == event.user.id)
-        or (username is not None and wait.username == username)
-        for wait in waits
-    )
-    if not is_addressee:
+    if not any(wait_matches_telegram_user(wait, event.user) for wait in waits):
         return
 
+    await resolve_user_id_for_matching_waits(app_storage, waits, event.user)
+
+    source_message_ids = [wait.source_message_id for wait in waits]
     closed_waits = await app_storage.close_waits_for_source_messages(
         chat_id=event.chat.id,
-        source_message_ids=[event.message_id],
+        source_message_ids=source_message_ids,
         closed_by_user_id=event.user.id,
         now=now,
     )
     if not closed_waits:
         return
 
+    username = event.user.username.lower() if event.user.username else None
     await app_storage.record_metric(
         "wait_closed_by_reaction",
         now=now,
