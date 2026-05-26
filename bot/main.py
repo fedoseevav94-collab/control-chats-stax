@@ -13,6 +13,7 @@ from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -74,6 +75,55 @@ def actor_label(user: User | None) -> str:
         return html.escape(f"@{user.username}")
     full_name = " ".join(part for part in (user.first_name, user.last_name) if part).strip()
     return html.escape(full_name or f"user_id:{user.id}")
+
+
+def commands_help_text(settings: Settings, user: User | None) -> str:
+    lines = [
+        "Доступные команды:",
+        "/start — активировать личные сообщения с ботом.",
+        "/help — показать эту подсказку.",
+        "/chatid — показать ID текущего чата.",
+        "",
+        "В рабочем чате также можно ответить на напоминание бота текстом:",
+        "закрыть — закрыть обращение.",
+        f"отложить — перенести следующее напоминание на {settings.reminder_interval_minutes} минут.",
+    ]
+
+    if is_leader(user, settings):
+        lines.extend(
+            [
+                "",
+                "Команды руководителя:",
+                "/stats — статистика работы бота.",
+                "/settings — текущие настройки, которые бот видит на сервере.",
+                "/fines — штрафы за текущий месяц с детализацией.",
+                "/fines 2026-05 — штрафы за выбранный месяц.",
+                "",
+                "Запросы на штраф приходят руководителю в личку. После решения бот обновляет третье уведомление в рабочем чате.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "",
+                "Команды /stats, /settings и /fines доступны только руководителю.",
+            ]
+        )
+
+    return "\n".join(lines)
+
+
+async def setup_bot_commands(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="Активировать личные сообщения"),
+            BotCommand(command="help", description="Показать команды бота"),
+            BotCommand(command="chatid", description="Показать ID текущего чата"),
+            BotCommand(command="stats", description="Статистика для руководителя"),
+            BotCommand(command="settings", description="Настройки для руководителя"),
+            BotCommand(command="fines", description="Отчёт по штрафам для руководителя"),
+        ]
+    )
 
 
 def wait_target_label(wait: PendingWait) -> str:
@@ -985,17 +1035,19 @@ async def register_user_from_message(app_storage: Storage, message: Message, set
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def start_private(message: Message, app_storage: Storage, settings: Settings) -> None:
     await register_user_from_message(app_storage, message, settings)
-    leader_note = ""
-    if is_leader(message.from_user, settings):
-        leader_note = "\n\nВы указаны как руководитель: вам будут приходить служебные уведомления и доступна команда /stats."
-
     await message.answer(
         "Готово. Теперь бот знает ваш Telegram user_id и сможет отправить личное "
         "напоминание, если вас ждут в рабочем чате.\n\n"
         "В группе я буду закрывать ожидания автоматически, когда ответ понятен или привязан к исходному сообщению. "
-        "Кнопками в напоминаниях может пользоваться любой участник чата, а я зафиксирую, кто нажал."
-        f"{leader_note}"
+        "Кнопками в напоминаниях может пользоваться любой участник чата, а я зафиксирую, кто нажал.\n\n"
+        f"{commands_help_text(settings, message.from_user)}"
     )
+
+
+@router.message(Command("help"))
+async def help_command(message: Message, app_storage: Storage, settings: Settings) -> None:
+    await register_user_from_message(app_storage, message, settings)
+    await message.answer(commands_help_text(settings, message.from_user))
 
 
 @router.message(Command("stats"))
@@ -2072,6 +2124,7 @@ async def main() -> None:
     await storage.connect()
 
     bot = Bot(settings.bot_token)
+    await setup_bot_commands(bot)
     dispatcher = Dispatcher(app_storage=storage, settings=settings)
     dispatcher.include_router(router)
 
