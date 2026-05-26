@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import format_elapsed, select_waits_answered_by_message, source_text_match_score, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -48,6 +48,44 @@ def test_extract_targets_reads_tg_user_text_links() -> None:
     assert targets[0].user_id == 456
 
 
+def test_message_requires_response_for_direct_task_with_mention() -> None:
+    text = "Оплатите заявку пожалуйста: 10009 @PolinaUser"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="polinauser", display_name="@polinauser", username="polinauser")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_message_requires_response_for_question_with_mention() -> None:
+    text = "@Norblacksmith когда будут лампочки?"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_message_without_mention_does_not_start_control_even_if_it_has_request() -> None:
+    message = SimpleNamespace(text="Сергей Николаевич, вы можете уточнить?", caption=None, photo=None, document=None, video=None)
+
+    assert not message_requires_response(message, [])
+
+
+def test_message_with_plain_greeting_mention_does_not_start_control() -> None:
+    text = "@Norblacksmith хорошего вечера!"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
+
+    assert not message_requires_response(message, targets)
+
+
+def test_message_with_mention_without_request_does_not_start_control() -> None:
+    text = "@Norblacksmith спасибо за помощь"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
+
+    assert not message_requires_response(message, targets)
+
+
 def test_wait_target_label_uses_clickable_user_id_when_username_is_hidden() -> None:
     wait = _wait(username="user_id:456", display_name="Hidden User", user_id=456)
 
@@ -62,6 +100,27 @@ def test_wait_targets_label_lists_unique_addresses() -> None:
     ]
 
     assert wait_targets_label(waits) == '@firstuser, <a href="tg://user?id=456">Hidden User</a>'
+
+
+def test_wait_keyboard_has_only_seen_and_close_buttons() -> None:
+    wait = _wait(username="firstuser", display_name="@firstuser", user_id=None)
+
+    keyboard = wait_keyboard(wait)
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert labels == ["👀 Вижу", "Закрыть"]
+
+
+def test_control_buttons_are_limited_to_leader_or_target() -> None:
+    wait = _wait(username="firstuser", display_name="@firstuser", user_id=None)
+    target = User(id=456, is_bot=False, first_name="First", username="firstuser")
+    leader = User(id=999, is_bot=False, first_name="Alex", username="Fedos_AV")
+    other = User(id=111, is_bot=False, first_name="Other", username="otheruser")
+    settings = SimpleNamespace(leader_username="fedos_av")
+
+    assert can_user_control_waits([wait], target, settings)
+    assert can_user_control_waits([wait], leader, settings)
+    assert not can_user_control_waits([wait], other, settings)
 
 
 def test_source_reference_embeds_message_link_in_quote_text() -> None:
@@ -201,5 +260,13 @@ def _wait(
         last_reminder_message_id=20,
         group_reminders_stopped_at=None,
         reminder_count=1,
+        seen_at=None,
+        seen_by_user_id=None,
+        last_intermediate_at=None,
+        reason_requested_at=None,
+        reason_due_at=None,
+        delay_reason=None,
+        delay_reason_at=None,
+        leader_request_sent_at=None,
         status="active",
     )
