@@ -63,11 +63,12 @@ TIMEZONE=Europe/Moscow
 WORKDAY_START=09:30
 WORKDAY_END=19:00
 DAILY_REPORT_TIME=09:30
-REMINDER_INTERVAL_MINUTES=20
+REMINDER_INTERVAL_MINUTES=15
 DIRECT_MESSAGE_AFTER_MINUTES=60
 LEADER_USERNAME=Fedos_AV
 ESCALATE_AFTER_REMINDERS=3
 MAX_GROUP_REMINDERS_IF_DM_UNREACHABLE=3
+FINE_AMOUNT_RUBLES=500
 DATABASE_PATH=bot.sqlite3
 SCHEDULER_STARTUP_GRACE_SECONDS=45
 ```
@@ -87,6 +88,7 @@ BOT_TOKEN=ваш_токен_бота
 Успешный запуск выглядит примерно так:
 
 ```text
+Allowed updates: message, callback_query, message_reaction
 Start polling
 Run polling for bot @...
 ```
@@ -117,4 +119,5 @@ Conflict: terminated by other getUpdates request
 
 - Не загружайте `.env` в GitHub. Токен должен храниться только в Koyeb Environment Variables.
 - Для polling должен работать только один экземпляр бота с этим токеном.
+- Для закрытия обращений по реакциям бот должен быть администратором в группе. Иначе Telegram не присылает `message_reaction`-обновления, даже если код их ожидает.
 - SQLite на Koyeb может храниться в файловой системе конкретного инстанса. Если Koyeb пересоздаст инстанс, локальный `bot.sqlite3` может потеряться. Для полностью надёжного хранения позже лучше перейти на внешнюю базу, например PostgreSQL.
