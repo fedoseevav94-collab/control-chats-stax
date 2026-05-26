@@ -116,3 +116,110 @@ def test_fine_report_groups_monthly_totals(tmp_path) -> None:
             await storage.close()
 
     asyncio.run(scenario())
+
+
+
+def test_seen_intermediate_reason_and_warning_history(tmp_path) -> None:
+    async def scenario() -> None:
+        storage = Storage(str(tmp_path / "bot.sqlite3"))
+        await storage.connect()
+        try:
+            now = datetime(2026, 5, 24, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+            await storage.upsert_wait(
+                chat_id=-100123,
+                chat_title="Work chat",
+                username_lower="polina",
+                display_name="Полина",
+                user_id=456,
+                source_message_id=100,
+                source_message_link="https://t.me/c/123/100",
+                source_quote="Оплатите заявку 10009 Полина",
+                mentioned_by_user_id=1,
+                now=now,
+                next_reminder_at=now + timedelta(minutes=15),
+                direct_message_due_at=now + timedelta(hours=1),
+            )
+            waits = await storage.active_waits_for_source_message(chat_id=-100123, source_message_id=100)
+
+            seen_waits = await storage.mark_source_seen(
+                chat_id=-100123,
+                source_message_ids=[100],
+                seen_by_user_id=456,
+                seen_at=now + timedelta(minutes=15),
+                next_reminder_at=now + timedelta(minutes=45),
+            )
+            await storage.record_wait_events(
+                seen_waits,
+                event_type="seen",
+                created_at=now + timedelta(minutes=15),
+                actor_user_id=456,
+                actor_label="Полина",
+                text="seen",
+            )
+            active_after_seen = await storage.active_waits_for_source_message(chat_id=-100123, source_message_id=100)
+
+            intermediate_waits = await storage.mark_source_intermediate(
+                chat_id=-100123,
+                source_message_ids=[100],
+                intermediate_at=now + timedelta(minutes=30),
+                next_reminder_at=now + timedelta(minutes=60),
+            )
+            await storage.record_wait_events(
+                intermediate_waits,
+                event_type="intermediate_answer",
+                created_at=now + timedelta(minutes=30),
+                actor_user_id=456,
+                actor_label="Полина",
+                text="Сейчас посмотрю",
+            )
+            active_after_intermediate = await storage.active_waits_for_source_message(chat_id=-100123, source_message_id=100)
+
+            requested = await storage.request_reason_for_source(
+                chat_id=-100123,
+                source_message_ids=[100],
+                requested_at=now + timedelta(minutes=60),
+                reason_due_at=now + timedelta(minutes=75),
+                reminder_message_id=777,
+            )
+            reasoned = await storage.set_delay_reason_for_source(
+                chat_id=-100123,
+                source_message_ids=[100],
+                reason="call",
+                reason_at=now + timedelta(minutes=61),
+            )
+            await storage.record_wait_events(
+                reasoned,
+                event_type="delay_reason",
+                created_at=now + timedelta(minutes=61),
+                actor_user_id=456,
+                actor_label="Полина",
+                text="📞 Был на созвоне",
+            )
+            closed = await storage.close_waits_for_source_messages(
+                chat_id=-100123,
+                source_message_ids=[100],
+                closed_by_user_id=999,
+                now=now + timedelta(minutes=80),
+            )
+            await storage.record_fine_decisions(
+                waits=closed,
+                decision="warning",
+                amount_rubles=0,
+                decided_by_user_id=999,
+                decided_at=now + timedelta(minutes=80),
+            )
+            stats = await storage.employee_stats(username_lower="polina", user_id=456, now=now + timedelta(minutes=80))
+
+            assert active_after_seen[0].seen_by_user_id == 456
+            assert active_after_seen[0].status == "active"
+            assert active_after_intermediate[0].last_intermediate_at is not None
+            assert active_after_intermediate[0].status == "active"
+            assert requested[0].reason_due_at == now + timedelta(minutes=75)
+            assert reasoned[0].delay_reason == "call"
+            assert stats.warnings_month == 1
+            assert stats.seen_count_7d == 1
+            assert stats.delay_reasons_7d == {"📞 Был на созвоне": 1}
+        finally:
+            await storage.close()
+
+    asyncio.run(scenario())

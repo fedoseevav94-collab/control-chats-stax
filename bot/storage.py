@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import aiosqlite
 
@@ -33,6 +33,14 @@ class PendingWait:
     last_reminder_message_id: int | None
     group_reminders_stopped_at: datetime | None
     reminder_count: int
+    seen_at: datetime | None
+    seen_by_user_id: int | None
+    last_intermediate_at: datetime | None
+    reason_requested_at: datetime | None
+    reason_due_at: datetime | None
+    delay_reason: str | None
+    delay_reason_at: datetime | None
+    leader_request_sent_at: datetime | None
     status: str
 
 
@@ -73,6 +81,37 @@ class FineReportDetail:
     source_quote: str
     amount_rubles: int
     decided_at: datetime
+
+
+@dataclass(frozen=True)
+class WaitEvent:
+    id: int
+    wait_id: int
+    chat_id: int
+    username: str
+    user_id: int | None
+    event_type: str
+    actor_user_id: int | None
+    actor_label: str | None
+    text: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class EmployeeStats:
+    username: str
+    display_name: str | None
+    user_id: int | None
+    requests_7d: int
+    closed_on_time_7d: int
+    overdue_7d: int
+    warnings_month: int
+    fines_month: int
+    avg_response_seconds_7d: int | None
+    seen_count_7d: int
+    answered_not_seen_count_7d: int
+    bot_missed_confirmed_month: int
+    delay_reasons_7d: dict[str, int]
 
 
 class Storage:
@@ -130,6 +169,14 @@ class Storage:
                 last_reminder_message_id INTEGER,
                 group_reminders_stopped_at TEXT,
                 reminder_count INTEGER NOT NULL DEFAULT 0,
+                seen_at TEXT,
+                seen_by_user_id INTEGER,
+                last_intermediate_at TEXT,
+                reason_requested_at TEXT,
+                reason_due_at TEXT,
+                delay_reason TEXT,
+                delay_reason_at TEXT,
+                leader_request_sent_at TEXT,
                 status TEXT NOT NULL DEFAULT 'active',
                 closed_at TEXT,
                 closed_by_user_id INTEGER
@@ -191,12 +238,38 @@ class Storage:
                 ON fine_decisions(decision, decided_at);
             CREATE INDEX IF NOT EXISTS idx_fine_decisions_user
                 ON fine_decisions(username_lower, user_id, decided_at);
+
+            CREATE TABLE IF NOT EXISTS wait_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wait_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                username_lower TEXT NOT NULL,
+                user_id INTEGER,
+                event_type TEXT NOT NULL,
+                actor_user_id INTEGER,
+                actor_label TEXT,
+                text TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_wait_events_wait
+                ON wait_events(wait_id, event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_wait_events_user
+                ON wait_events(username_lower, user_id, event_type, created_at);
             """
         )
         await self._add_column_if_missing("waits", "direct_message_attempted_at", "TEXT")
         await self._add_column_if_missing("waits", "last_reminder_message_id", "INTEGER")
         await self._add_column_if_missing("waits", "group_reminders_stopped_at", "TEXT")
         await self._add_column_if_missing("waits", "display_name", "TEXT")
+        await self._add_column_if_missing("waits", "leader_request_sent_at", "TEXT")
+        await self._add_column_if_missing("waits", "delay_reason_at", "TEXT")
+        await self._add_column_if_missing("waits", "delay_reason", "TEXT")
+        await self._add_column_if_missing("waits", "reason_due_at", "TEXT")
+        await self._add_column_if_missing("waits", "reason_requested_at", "TEXT")
+        await self._add_column_if_missing("waits", "last_intermediate_at", "TEXT")
+        await self._add_column_if_missing("waits", "seen_by_user_id", "INTEGER")
+        await self._add_column_if_missing("waits", "seen_at", "TEXT")
         await self.conn.commit()
 
     async def leader_daily_report_was_sent(self, *, report_date: date) -> bool:
@@ -752,6 +825,155 @@ class Storage:
         await self.conn.commit()
         return waits
 
+    async def mark_source_seen(
+        self,
+        *,
+        chat_id: int,
+        source_message_ids: list[int],
+        seen_by_user_id: int,
+        seen_at: datetime,
+        next_reminder_at: datetime,
+    ) -> list[PendingWait]:
+        waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+        if not waits:
+            return []
+
+        wait_ids = [wait.id for wait in waits]
+        placeholders = ", ".join("?" for _ in wait_ids)
+        await self.conn.execute(
+            f"""
+            UPDATE waits
+            SET seen_at = ?,
+                seen_by_user_id = ?,
+                next_reminder_at = ?,
+                group_reminders_stopped_at = NULL,
+                updated_at = ?
+            WHERE id IN ({placeholders}) AND status = 'active'
+            """,
+            (dt_to_db(seen_at), seen_by_user_id, dt_to_db(next_reminder_at), dt_to_db(seen_at), *wait_ids),
+        )
+        await self.conn.commit()
+        return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+
+    async def mark_source_intermediate(
+        self,
+        *,
+        chat_id: int,
+        source_message_ids: list[int],
+        intermediate_at: datetime,
+        next_reminder_at: datetime,
+    ) -> list[PendingWait]:
+        waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+        if not waits:
+            return []
+
+        wait_ids = [wait.id for wait in waits]
+        placeholders = ", ".join("?" for _ in wait_ids)
+        await self.conn.execute(
+            f"""
+            UPDATE waits
+            SET last_intermediate_at = ?,
+                next_reminder_at = ?,
+                group_reminders_stopped_at = NULL,
+                updated_at = ?
+            WHERE id IN ({placeholders}) AND status = 'active'
+            """,
+            (dt_to_db(intermediate_at), dt_to_db(next_reminder_at), dt_to_db(intermediate_at), *wait_ids),
+        )
+        await self.conn.commit()
+        return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+
+    async def request_reason_for_source(
+        self,
+        *,
+        chat_id: int,
+        source_message_ids: list[int],
+        requested_at: datetime,
+        reason_due_at: datetime,
+        reminder_message_id: int | None = None,
+    ) -> list[PendingWait]:
+        waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+        if not waits:
+            return []
+
+        wait_ids = [wait.id for wait in waits]
+        placeholders = ", ".join("?" for _ in wait_ids)
+        await self.conn.execute(
+            f"""
+            UPDATE waits
+            SET reason_requested_at = coalesce(reason_requested_at, ?),
+                reason_due_at = ?,
+                next_reminder_at = ?,
+                last_reminder_message_id = coalesce(?, last_reminder_message_id),
+                reminder_count = reminder_count + 1,
+                updated_at = ?
+            WHERE id IN ({placeholders}) AND status = 'active'
+            """,
+            (
+                dt_to_db(requested_at),
+                dt_to_db(reason_due_at),
+                dt_to_db(reason_due_at),
+                reminder_message_id,
+                dt_to_db(requested_at),
+                *wait_ids,
+            ),
+        )
+        await self.conn.commit()
+        return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+
+    async def set_delay_reason_for_source(
+        self,
+        *,
+        chat_id: int,
+        source_message_ids: list[int],
+        reason: str,
+        reason_at: datetime,
+    ) -> list[PendingWait]:
+        waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+        if not waits:
+            return []
+
+        wait_ids = [wait.id for wait in waits]
+        placeholders = ", ".join("?" for _ in wait_ids)
+        await self.conn.execute(
+            f"""
+            UPDATE waits
+            SET delay_reason = ?,
+                delay_reason_at = ?,
+                updated_at = ?
+            WHERE id IN ({placeholders}) AND status = 'active'
+            """,
+            (reason, dt_to_db(reason_at), dt_to_db(reason_at), *wait_ids),
+        )
+        await self.conn.commit()
+        return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+
+    async def mark_leader_request_sent_for_source(
+        self,
+        *,
+        chat_id: int,
+        source_message_ids: list[int],
+        sent_at: datetime,
+    ) -> list[PendingWait]:
+        waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+        if not waits:
+            return []
+
+        wait_ids = [wait.id for wait in waits]
+        placeholders = ", ".join("?" for _ in wait_ids)
+        await self.conn.execute(
+            f"""
+            UPDATE waits
+            SET leader_request_sent_at = ?,
+                group_reminders_stopped_at = ?,
+                updated_at = ?
+            WHERE id IN ({placeholders}) AND status = 'active'
+            """,
+            (dt_to_db(sent_at), dt_to_db(sent_at), dt_to_db(sent_at), *wait_ids),
+        )
+        await self.conn.commit()
+        return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
+
     async def get_wait_by_id(self, wait_id: int) -> PendingWait | None:
         cursor = await self.conn.execute("SELECT * FROM waits WHERE id = ?", (wait_id,))
         row = await cursor.fetchone()
@@ -888,6 +1110,177 @@ class Storage:
         )
         await self.conn.commit()
 
+    async def record_wait_event(
+        self,
+        wait: PendingWait,
+        *,
+        event_type: str,
+        created_at: datetime,
+        actor_user_id: int | None = None,
+        actor_label: str | None = None,
+        text: str | None = None,
+    ) -> None:
+        await self.conn.execute(
+            """
+            INSERT INTO wait_events (
+                wait_id, chat_id, username_lower, user_id, event_type,
+                actor_user_id, actor_label, text, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                wait.id,
+                wait.chat_id,
+                wait.username,
+                wait.user_id,
+                event_type,
+                actor_user_id,
+                actor_label,
+                text,
+                dt_to_db(created_at),
+            ),
+        )
+        await self.conn.commit()
+
+    async def record_wait_events(
+        self,
+        waits: list[PendingWait],
+        *,
+        event_type: str,
+        created_at: datetime,
+        actor_user_id: int | None = None,
+        actor_label: str | None = None,
+        text: str | None = None,
+    ) -> None:
+        for wait in waits:
+            await self.record_wait_event(
+                wait,
+                event_type=event_type,
+                created_at=created_at,
+                actor_user_id=actor_user_id,
+                actor_label=actor_label,
+                text=text,
+            )
+
+    async def wait_events_for_source(
+        self,
+        *,
+        chat_id: int,
+        source_message_id: int,
+    ) -> list[WaitEvent]:
+        cursor = await self.conn.execute(
+            """
+            SELECT e.*
+            FROM wait_events e
+            JOIN waits w ON w.id = e.wait_id
+            WHERE w.chat_id = ?
+              AND w.source_message_id = ?
+            ORDER BY e.created_at, e.id
+            """,
+            (chat_id, source_message_id),
+        )
+        rows = await cursor.fetchall()
+        return [self._wait_event(row) for row in rows]
+
+    async def employee_stats(
+        self,
+        *,
+        username_lower: str | None,
+        user_id: int | None,
+        now: datetime,
+    ) -> EmployeeStats:
+        if username_lower is None and user_id is None:
+            raise ValueError("username_lower or user_id is required")
+
+        week_start = now - timedelta(days=7)
+        month_start = datetime(now.year, now.month, 1, tzinfo=now.tzinfo)
+
+        clauses: list[str] = []
+        params: list[object] = []
+        if username_lower is not None:
+            clauses.append("username_lower = ?")
+            params.append(username_lower)
+        if user_id is not None:
+            clauses.append("user_id = ?")
+            params.append(user_id)
+        user_clause = " OR ".join(clauses)
+
+        cursor = await self.conn.execute(
+            f"""
+            SELECT
+                coalesce(max(display_name), max(username_lower)) AS display_name,
+                max(username_lower) AS username_lower,
+                max(user_id) AS user_id,
+                count(*) AS requests_7d,
+                coalesce(sum(CASE WHEN reminder_count = 0 AND status = 'closed' THEN 1 ELSE 0 END), 0) AS closed_on_time_7d,
+                coalesce(sum(CASE WHEN reminder_count > 0 THEN 1 ELSE 0 END), 0) AS overdue_7d,
+                avg(CASE WHEN status = 'closed' AND closed_at IS NOT NULL THEN (julianday(closed_at) - julianday(created_at)) * 86400 END) AS avg_response_seconds
+            FROM waits
+            WHERE created_at >= ?
+              AND ({user_clause})
+            """,
+            (dt_to_db(week_start), *params),
+        )
+        row = await cursor.fetchone()
+
+        cursor = await self.conn.execute(
+            f"""
+            SELECT
+                coalesce(sum(CASE WHEN decision = 'issued' THEN 1 ELSE 0 END), 0) AS fines_month,
+                coalesce(sum(CASE WHEN decision = 'warning' THEN 1 ELSE 0 END), 0) AS warnings_month,
+                coalesce(sum(CASE WHEN decision = 'manual_answer_confirmed' THEN 1 ELSE 0 END), 0) AS bot_missed_confirmed_month
+            FROM fine_decisions
+            WHERE decided_at >= ?
+              AND ({user_clause})
+            """,
+            (dt_to_db(month_start), *params),
+        )
+        decisions = await cursor.fetchone()
+
+        cursor = await self.conn.execute(
+            f"""
+            SELECT
+                coalesce(sum(CASE WHEN event_type = 'seen' THEN 1 ELSE 0 END), 0) AS seen_count,
+                coalesce(sum(CASE WHEN event_type = 'reason_answered_not_seen' THEN 1 ELSE 0 END), 0) AS answered_not_seen_count
+            FROM wait_events
+            WHERE created_at >= ?
+              AND ({user_clause})
+            """,
+            (dt_to_db(week_start), *params),
+        )
+        events = await cursor.fetchone()
+
+        cursor = await self.conn.execute(
+            f"""
+            SELECT text, count(*) AS total
+            FROM wait_events
+            WHERE created_at >= ?
+              AND event_type = 'delay_reason'
+              AND ({user_clause})
+            GROUP BY text
+            ORDER BY total DESC, text
+            """,
+            (dt_to_db(week_start), *params),
+        )
+        reasons = {reason_row["text"]: reason_row["total"] for reason_row in await cursor.fetchall() if reason_row["text"]}
+
+        avg_raw = row["avg_response_seconds"] if row else None
+        return EmployeeStats(
+            username=(row["username_lower"] if row and row["username_lower"] else username_lower or f"user_id:{user_id}"),
+            display_name=(row["display_name"] if row else None),
+            user_id=(row["user_id"] if row and row["user_id"] else user_id),
+            requests_7d=int(row["requests_7d"] or 0) if row else 0,
+            closed_on_time_7d=int(row["closed_on_time_7d"] or 0) if row else 0,
+            overdue_7d=int(row["overdue_7d"] or 0) if row else 0,
+            warnings_month=int(decisions["warnings_month"] or 0),
+            fines_month=int(decisions["fines_month"] or 0),
+            avg_response_seconds_7d=int(avg_raw) if avg_raw is not None else None,
+            seen_count_7d=int(events["seen_count"] or 0),
+            answered_not_seen_count_7d=int(events["answered_not_seen_count"] or 0),
+            bot_missed_confirmed_month=int(decisions["bot_missed_confirmed_month"] or 0),
+            delay_reasons_7d=reasons,
+        )
+
     async def record_metric(
         self,
         event_type: str,
@@ -955,7 +1348,41 @@ class Storage:
                 else None
             ),
             reminder_count=row["reminder_count"],
+            seen_at=dt_from_db(row["seen_at"]) if row["seen_at"] else None,
+            seen_by_user_id=row["seen_by_user_id"],
+            last_intermediate_at=(
+                dt_from_db(row["last_intermediate_at"])
+                if row["last_intermediate_at"]
+                else None
+            ),
+            reason_requested_at=(
+                dt_from_db(row["reason_requested_at"])
+                if row["reason_requested_at"]
+                else None
+            ),
+            reason_due_at=dt_from_db(row["reason_due_at"]) if row["reason_due_at"] else None,
+            delay_reason=row["delay_reason"],
+            delay_reason_at=dt_from_db(row["delay_reason_at"]) if row["delay_reason_at"] else None,
+            leader_request_sent_at=(
+                dt_from_db(row["leader_request_sent_at"])
+                if row["leader_request_sent_at"]
+                else None
+            ),
             status=row["status"],
+        )
+
+    def _wait_event(self, row: aiosqlite.Row) -> WaitEvent:
+        return WaitEvent(
+            id=row["id"],
+            wait_id=row["wait_id"],
+            chat_id=row["chat_id"],
+            username=row["username_lower"],
+            user_id=row["user_id"],
+            event_type=row["event_type"],
+            actor_user_id=row["actor_user_id"],
+            actor_label=row["actor_label"],
+            text=row["text"],
+            created_at=dt_from_db(row["created_at"]),
         )
 
     def _daily_report_item(self, row: aiosqlite.Row) -> DailyReportItem:

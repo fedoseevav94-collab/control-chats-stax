@@ -29,6 +29,13 @@ class Settings:
     escalate_after_reminders: int
     max_group_reminders_if_dm_unreachable: int
     fine_amount_rubles: int
+    seen_delay_minutes: int
+    reason_request_before_fine_minutes: int
+    smart_reply_delay_minutes: int
+    enable_reason_before_fine: bool
+    enable_seen_button: bool
+    enable_smart_reply_detection: bool
+    enable_warning_decision: bool
     database_path: Path
     scheduler_tick_seconds: int = 30
     scheduler_startup_grace_seconds: int = 45
@@ -58,6 +65,13 @@ def load_settings() -> Settings:
         escalate_after_reminders=env.int("ESCALATE_AFTER_REMINDERS", 3),
         max_group_reminders_if_dm_unreachable=env.int("MAX_GROUP_REMINDERS_IF_DM_UNREACHABLE", 3),
         fine_amount_rubles=env.int("FINE_AMOUNT_RUBLES", 500),
+        seen_delay_minutes=env.int("SEEN_DELAY_MINUTES", 30),
+        reason_request_before_fine_minutes=env.int("REASON_REQUEST_BEFORE_FINE_MINUTES", 15),
+        smart_reply_delay_minutes=env.int("SMART_REPLY_DELAY_MINUTES", 30),
+        enable_reason_before_fine=env.bool("ENABLE_REASON_BEFORE_FINE", True),
+        enable_seen_button=env.bool("ENABLE_SEEN_BUTTON", True),
+        enable_smart_reply_detection=env.bool("ENABLE_SMART_REPLY_DETECTION", True),
+        enable_warning_decision=env.bool("ENABLE_WARNING_DECISION", True),
         database_path=Path(env.str("DATABASE_PATH", "bot.sqlite3")),
         scheduler_tick_seconds=env.int("SCHEDULER_TICK_SECONDS", 30),
         scheduler_startup_grace_seconds=env.int("SCHEDULER_STARTUP_GRACE_SECONDS", 45),
