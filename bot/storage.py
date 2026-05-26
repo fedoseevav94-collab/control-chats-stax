@@ -40,6 +40,7 @@ class PendingWait:
 class DailyReportItem:
     id: int
     chat_id: int
+    chat_title: str | None
     username: str
     display_name: str | None
     user_id: int | None
@@ -49,6 +50,29 @@ class DailyReportItem:
     reminder_count: int
     direct_message_sent_at: datetime | None
     group_reminders_stopped_at: datetime | None
+
+
+@dataclass(frozen=True)
+class FineReportItem:
+    username: str
+    display_name: str | None
+    user_id: int | None
+    fine_count: int
+    total_amount: int
+
+
+@dataclass(frozen=True)
+class FineReportDetail:
+    id: int
+    username: str
+    display_name: str | None
+    user_id: int | None
+    chat_id: int
+    chat_title: str | None
+    source_message_link: str | None
+    source_quote: str
+    amount_rubles: int
+    decided_at: datetime
 
 
 class Storage:
@@ -139,6 +163,34 @@ class Storage:
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY (chat_id, report_date)
             );
+
+            CREATE TABLE IF NOT EXISTS leader_daily_reports (
+                report_date TEXT PRIMARY KEY,
+                sent_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS fine_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wait_id INTEGER NOT NULL UNIQUE,
+                chat_id INTEGER NOT NULL,
+                chat_title TEXT,
+                username_lower TEXT NOT NULL,
+                display_name TEXT,
+                user_id INTEGER,
+                source_message_id INTEGER NOT NULL,
+                source_message_link TEXT,
+                source_quote TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                amount_rubles INTEGER NOT NULL DEFAULT 0,
+                decided_by_user_id INTEGER NOT NULL,
+                decided_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_fine_decisions_month
+                ON fine_decisions(decision, decided_at);
+            CREATE INDEX IF NOT EXISTS idx_fine_decisions_user
+                ON fine_decisions(username_lower, user_id, decided_at);
             """
         )
         await self._add_column_if_missing("waits", "direct_message_attempted_at", "TEXT")
@@ -146,6 +198,179 @@ class Storage:
         await self._add_column_if_missing("waits", "group_reminders_stopped_at", "TEXT")
         await self._add_column_if_missing("waits", "display_name", "TEXT")
         await self.conn.commit()
+
+    async def leader_daily_report_was_sent(self, *, report_date: date) -> bool:
+        cursor = await self.conn.execute(
+            """
+            SELECT 1
+            FROM leader_daily_reports
+            WHERE report_date = ?
+            """,
+            (report_date.isoformat(),),
+        )
+        return await cursor.fetchone() is not None
+
+    async def mark_leader_daily_report_sent(self, *, report_date: date, sent_at: datetime) -> None:
+        await self.conn.execute(
+            """
+            INSERT OR REPLACE INTO leader_daily_reports (report_date, sent_at)
+            VALUES (?, ?)
+            """,
+            (report_date.isoformat(), dt_to_db(sent_at)),
+        )
+        await self.conn.commit()
+
+    async def record_fine_decisions(
+        self,
+        *,
+        waits: list[PendingWait],
+        decision: str,
+        amount_rubles: int,
+        decided_by_user_id: int,
+        decided_at: datetime,
+    ) -> None:
+        for wait in waits:
+            await self.conn.execute(
+                """
+                INSERT INTO fine_decisions (
+                    wait_id, chat_id, chat_title, username_lower, display_name, user_id,
+                    source_message_id, source_message_link, source_quote,
+                    decision, amount_rubles, decided_by_user_id, decided_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(wait_id) DO UPDATE SET
+                    decision=excluded.decision,
+                    amount_rubles=excluded.amount_rubles,
+                    decided_by_user_id=excluded.decided_by_user_id,
+                    decided_at=excluded.decided_at
+                """,
+                (
+                    wait.id,
+                    wait.chat_id,
+                    wait.chat_title,
+                    wait.username,
+                    wait.display_name,
+                    wait.user_id,
+                    wait.source_message_id,
+                    wait.source_message_link,
+                    wait.source_quote,
+                    decision,
+                    amount_rubles,
+                    decided_by_user_id,
+                    dt_to_db(decided_at),
+                    dt_to_db(decided_at),
+                ),
+            )
+        await self.conn.commit()
+
+    async def fine_total_for_month(self, *, start_at: datetime, end_at: datetime) -> int:
+        cursor = await self.conn.execute(
+            """
+            SELECT coalesce(sum(amount_rubles), 0) AS total
+            FROM fine_decisions
+            WHERE decision = 'issued'
+              AND decided_at >= ?
+              AND decided_at < ?
+            """,
+            (dt_to_db(start_at), dt_to_db(end_at)),
+        )
+        row = await cursor.fetchone()
+        return int(row["total"])
+
+    async def fine_total_for_month_by_users(
+        self,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        username_lowers: list[str],
+    ) -> int:
+        if not username_lowers:
+            return 0
+
+        unique_usernames = sorted(set(username_lowers))
+        placeholders = ", ".join("?" for _ in unique_usernames)
+        cursor = await self.conn.execute(
+            f"""
+            SELECT coalesce(sum(amount_rubles), 0) AS total
+            FROM fine_decisions
+            WHERE decision = 'issued'
+              AND decided_at >= ?
+              AND decided_at < ?
+              AND username_lower IN ({placeholders})
+            """,
+            (dt_to_db(start_at), dt_to_db(end_at), *unique_usernames),
+        )
+        row = await cursor.fetchone()
+        return int(row["total"])
+
+    async def fine_report_for_month(self, *, start_at: datetime, end_at: datetime) -> list[FineReportItem]:
+        cursor = await self.conn.execute(
+            """
+            SELECT
+                username_lower,
+                max(display_name) AS display_name,
+                max(user_id) AS user_id,
+                count(*) AS fine_count,
+                coalesce(sum(amount_rubles), 0) AS total_amount
+            FROM fine_decisions
+            WHERE decision = 'issued'
+              AND decided_at >= ?
+              AND decided_at < ?
+            GROUP BY username_lower
+            ORDER BY total_amount DESC, fine_count DESC, username_lower
+            """,
+            (dt_to_db(start_at), dt_to_db(end_at)),
+        )
+        rows = await cursor.fetchall()
+        return [
+            FineReportItem(
+                username=row["username_lower"],
+                display_name=row["display_name"],
+                user_id=row["user_id"],
+                fine_count=row["fine_count"],
+                total_amount=row["total_amount"],
+            )
+            for row in rows
+        ]
+
+    async def fine_details_for_month(self, *, start_at: datetime, end_at: datetime) -> list[FineReportDetail]:
+        cursor = await self.conn.execute(
+            """
+            SELECT
+                id,
+                username_lower,
+                display_name,
+                user_id,
+                chat_id,
+                chat_title,
+                source_message_link,
+                source_quote,
+                amount_rubles,
+                decided_at
+            FROM fine_decisions
+            WHERE decision = 'issued'
+              AND decided_at >= ?
+              AND decided_at < ?
+            ORDER BY decided_at DESC, id DESC
+            """,
+            (dt_to_db(start_at), dt_to_db(end_at)),
+        )
+        rows = await cursor.fetchall()
+        return [
+            FineReportDetail(
+                id=row["id"],
+                username=row["username_lower"],
+                display_name=row["display_name"],
+                user_id=row["user_id"],
+                chat_id=row["chat_id"],
+                chat_title=row["chat_title"],
+                source_message_link=row["source_message_link"],
+                source_quote=row["source_quote"],
+                amount_rubles=row["amount_rubles"],
+                decided_at=dt_from_db(row["decided_at"]),
+            )
+            for row in rows
+        ]
 
     async def chats_with_waits_created_between(
         self,
@@ -737,6 +962,7 @@ class Storage:
         return DailyReportItem(
             id=row["id"],
             chat_id=row["chat_id"],
+            chat_title=row["chat_title"],
             username=row["username_lower"],
             display_name=row["display_name"],
             user_id=row["user_id"],

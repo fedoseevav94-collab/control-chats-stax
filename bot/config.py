@@ -28,6 +28,7 @@ class Settings:
     leader_username: str
     escalate_after_reminders: int
     max_group_reminders_if_dm_unreachable: int
+    fine_amount_rubles: int
     database_path: Path
     scheduler_tick_seconds: int = 30
     scheduler_startup_grace_seconds: int = 45
@@ -56,6 +57,7 @@ def load_settings() -> Settings:
         leader_username=env.str("LEADER_USERNAME", "Fedos_AV").removeprefix("@").lower(),
         escalate_after_reminders=env.int("ESCALATE_AFTER_REMINDERS", 3),
         max_group_reminders_if_dm_unreachable=env.int("MAX_GROUP_REMINDERS_IF_DM_UNREACHABLE", 3),
+        fine_amount_rubles=env.int("FINE_AMOUNT_RUBLES", 500),
         database_path=Path(env.str("DATABASE_PATH", "bot.sqlite3")),
         scheduler_tick_seconds=env.int("SCHEDULER_TICK_SECONDS", 30),
         scheduler_startup_grace_seconds=env.int("SCHEDULER_STARTUP_GRACE_SECONDS", 45),

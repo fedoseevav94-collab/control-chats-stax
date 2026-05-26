@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import html
 import logging
 import re
@@ -11,6 +13,7 @@ from aiogram.enums import ChatType
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -21,7 +24,7 @@ from aiogram.types import (
 )
 
 from bot.config import Settings, load_settings
-from bot.storage import DailyReportItem, PendingWait, Storage
+from bot.storage import DailyReportItem, FineReportDetail, PendingWait, Storage
 from bot.telegram_utils import (
     MentionTarget,
     build_message_link,
@@ -121,6 +124,14 @@ def wait_keyboard(wait: PendingWait) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def source_link_keyboard(wait: PendingWait) -> InlineKeyboardMarkup | None:
+    if not wait.source_message_link:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)]]
+    )
+
+
 def answer_confirmation_keyboard(wait: PendingWait) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -130,6 +141,18 @@ def answer_confirmation_keyboard(wait: PendingWait) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def fine_decision_keyboard(wait: PendingWait, fine_amount: int) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(text=f"Выписать штраф {fine_amount} ₽", callback_data=f"wait:fine:{wait.id}"),
+            InlineKeyboardButton(text="Не штрафовать", callback_data=f"wait:nofine:{wait.id}"),
+        ]
+    ]
+    if wait.source_message_link:
+        buttons.append([InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def normalized_message_text(message: Message) -> str:
@@ -585,6 +608,123 @@ def daily_report_text(report_date: date, items: list[DailyReportItem]) -> str:
     return "\n".join(lines)
 
 
+
+def month_period(now: datetime, settings: Settings, month_value: str | None = None) -> tuple[datetime, datetime]:
+    if month_value:
+        year_raw, month_raw = month_value.split("-", maxsplit=1)
+        year = int(year_raw)
+        month = int(month_raw)
+        if month < 1 or month > 12:
+            raise ValueError
+        start_at = datetime(year, month, 1, tzinfo=settings.timezone)
+    else:
+        local_now = now.astimezone(settings.timezone)
+        start_at = datetime(local_now.year, local_now.month, 1, tzinfo=settings.timezone)
+
+    if start_at.month == 12:
+        end_at = datetime(start_at.year + 1, 1, 1, tzinfo=settings.timezone)
+    else:
+        end_at = datetime(start_at.year, start_at.month + 1, 1, tzinfo=settings.timezone)
+    return start_at, end_at
+
+
+def fine_target_label(item: FineReportDetail) -> str:
+    if item.user_id and item.display_name and item.display_name != display_username(item.username):
+        name = html.escape(item.display_name)
+        return f'<a href="tg://user?id={item.user_id}">{name}</a>'
+    if item.username.startswith("user_id:") and item.user_id:
+        name = html.escape(item.display_name or f"user_id:{item.user_id}")
+        return f'<a href="tg://user?id={item.user_id}">{name}</a>'
+    if item.username.startswith("user_id:"):
+        return html.escape(item.display_name or item.username)
+    return display_username(item.username)
+
+
+def fine_report_text(month_start: datetime, items: list[FineReportDetail], settings: Settings) -> str:
+    title = f"Отчёт по штрафам за {month_start.strftime('%m.%Y')}"
+    if not items:
+        return f"{title}\nНачисленных штрафов нет."
+
+    total_amount = sum(item.amount_rubles for item in items)
+    total_count = len(items)
+    lines = [
+        title,
+        f"Всего: {total_amount} ₽ ({plural_ru(total_count, ('штраф', 'штрафа', 'штрафов'))})",
+        "Детализация:",
+    ]
+    max_items = 25
+    for index, item in enumerate(items[:max_items], start=1):
+        chat_title = html.escape(item.chat_title or f"chat_id:{item.chat_id}")
+        reference = source_reference(item.source_message_link, item.source_quote)
+        lines.extend(
+            [
+                f"{index}. {fine_target_label(item)} — {item.amount_rubles} ₽",
+                f"Когда: {format_event_dt(item.decided_at, settings)}",
+                f"Чат: {chat_title}",
+                f"За что: {reference}",
+            ]
+        )
+    if len(items) > max_items:
+        lines.append(f"Ещё {len(items) - max_items} штрафов не показано в сообщении. Полная детализация есть в CSV-файле.")
+    return "\n".join(lines)
+
+
+def fine_report_csv(month_start: datetime, items: list[FineReportDetail]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([
+        "month",
+        "decided_at",
+        "username",
+        "display_name",
+        "user_id",
+        "chat_id",
+        "chat_title",
+        "amount_rubles",
+        "source_quote",
+        "source_message_link",
+    ])
+    for item in items:
+        writer.writerow([
+            month_start.strftime("%Y-%m"),
+            item.decided_at.isoformat(),
+            item.username,
+            item.display_name or "",
+            item.user_id or "",
+            item.chat_id,
+            item.chat_title or "",
+            item.amount_rubles,
+            item.source_quote,
+            item.source_message_link or "",
+        ])
+    return buffer.getvalue().encode("utf-8-sig")
+
+def leader_daily_report_text(report_date: date, items_by_chat: dict[int, list[DailyReportItem]]) -> str:
+    title = f"Общий отчёт за {report_date.strftime('%d.%m.%Y')}"
+    all_items = [item for items in items_by_chat.values() for item in items]
+    if not all_items:
+        return f"{title}\nНезакрытых обращений за прошедший день нет."
+
+    lines = [
+        title,
+        f"Незакрытых обращений: {len(all_items)}",
+    ]
+    max_items_per_chat = 10
+    for chat_id, items in items_by_chat.items():
+        if not items:
+            continue
+        chat_title = items[0].chat_title or str(chat_id)
+        lines.append("")
+        lines.append(f"Чат: {html.escape(chat_title)}")
+        for index, item in enumerate(items[:max_items_per_chat], start=1):
+            reference = source_reference(item.source_message_link, item.source_quote)
+            lines.append(f"{index}. {item_target_label(item)} не ответил: {reference}")
+        if len(items) > max_items_per_chat:
+            lines.append(f"Ещё {len(items) - max_items_per_chat} обращений не показано.")
+
+    return "\n".join(lines)
+
+
 async def edit_reminder_closed(bot: Bot, wait: PendingWait, text: str) -> None:
     if not wait.last_reminder_message_id:
         return
@@ -883,6 +1023,10 @@ async def stats_command(message: Message, app_storage: Storage, settings: Settin
                 f"Оставлено под контролем: {summary.get('wait_kept_by_confirm_button', 0)}",
                 f"Переадресовано: {summary.get('wait_delegated', 0)}",
                 f"Групповых напоминаний: {summary.get('group_reminder_sent', 0)}",
+                f"Запрошено решений по штрафу: {summary.get('fine_decision_requested', 0)}",
+                f"Штрафов назначено: {summary.get('fine_issued', 0)}",
+                f"Штрафов отклонено: {summary.get('fine_declined', 0)}",
+                f"Запросов по штрафу отправлено в личку: {summary.get('fine_request_dm_sent', 0)}",
                 f"Остановлено после лимита: {summary.get('group_reminders_stopped_after_dm_failure', 0)}",
                 f"Эскалаций руководителю: {summary.get('leader_escalation_sent', 0)}",
                 f"Личных сообщений отправлено: {summary.get('direct_message_sent', 0)}",
@@ -910,10 +1054,41 @@ async def settings_command(message: Message, app_storage: Storage, settings: Set
                 f"Часовой пояс: {settings.timezone_name}",
                 f"Отчёт каждый день: {settings.daily_report_time.strftime('%H:%M')}",
                 f"Руководитель: {display_username(settings.leader_username)}",
+                f"Штраф: {settings.fine_amount_rubles} ₽",
                 f"База данных: {settings.database_path}",
             ]
         )
     )
+
+
+@router.message(Command("fines"))
+async def fines_command(message: Message, app_storage: Storage, settings: Settings) -> None:
+    await register_user_from_message(app_storage, message, settings)
+    if not is_leader(message.from_user, settings):
+        await message.answer("Отчёт по штрафам доступен только руководителю.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    month_value = parts[1].strip() if len(parts) > 1 else None
+    try:
+        start_at, end_at = month_period(now_in_tz(settings), settings, month_value)
+    except ValueError:
+        await message.answer("Укажите месяц в формате /fines 2026-05 или просто /fines для текущего месяца.")
+        return
+
+    items = await app_storage.fine_details_for_month(start_at=start_at, end_at=end_at)
+    await message.answer(
+        fine_report_text(start_at, items, settings),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+    if items:
+        document = BufferedInputFile(
+            fine_report_csv(start_at, items),
+            filename=f"fines_{start_at.strftime('%Y_%m')}.csv",
+        )
+        await message.answer_document(document, caption="CSV-выгрузка штрафов за месяц")
 
 
 @router.message(Command("chatid"))
@@ -1303,8 +1478,6 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
     logger.info("Callback %s for wait %s from user %s", action, wait_id_raw, callback.from_user.id)
     wait = await app_storage.get_wait_by_id(int(wait_id_raw))
     if not wait or wait.status != "active":
-        if wait:
-            await mark_wait_already_closed(bot, wait)
         await safe_callback_answer(callback, "Это ожидание уже закрыто.", show_alert=False)
         return
 
@@ -1317,6 +1490,71 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         private_chat_started=False,
         now=now,
     )
+
+    if action in {"fine", "nofine"}:
+        if not is_leader(callback.from_user, settings):
+            await safe_callback_answer(
+                callback,
+                f"Решение по штрафу может принять только {display_username(settings.leader_username)}.",
+                show_alert=True,
+            )
+            return
+
+        closed_waits = await app_storage.close_waits_for_source_messages(
+            chat_id=wait.chat_id,
+            source_message_ids=[wait.source_message_id],
+            closed_by_user_id=callback.from_user.id,
+            now=now,
+        )
+        if not closed_waits:
+            await safe_callback_answer(callback, "Ожидание уже закрыто.", show_alert=False)
+            return
+
+        decision = "issued" if action == "fine" else "declined"
+        amount = settings.fine_amount_rubles if action == "fine" else 0
+        await app_storage.record_fine_decisions(
+            waits=closed_waits,
+            decision=decision,
+            amount_rubles=amount,
+            decided_by_user_id=callback.from_user.id,
+            decided_at=now,
+        )
+        await app_storage.record_metric(
+            "fine_issued" if action == "fine" else "fine_declined",
+            now=now,
+            chat_id=wait.chat_id,
+            username_lower=wait.username,
+            wait_id=wait.id,
+            value=len(closed_waits),
+        )
+
+        reference = source_reference(wait.source_message_link, wait.source_quote)
+        if action == "fine":
+            status_line = f"Штраф назначен: {settings.fine_amount_rubles} ₽"
+            if len(closed_waits) > 1:
+                status_line += " каждому адресату"
+        else:
+            status_line = "Штраф не назначен"
+        group_text = (
+            f"{status_line}.\n"
+            f"Решение принял: {actor_label(callback.from_user)}\n"
+            f"Время решения: {format_event_dt(now, settings)}\n"
+            f"Адресаты: {wait_targets_label(closed_waits)}\n"
+            f"Исходное сообщение: {reference}"
+        )
+        private_text = (
+            f"Решение сохранено.\n"
+            f"{status_line}.\n"
+            f"Я обновил третье уведомление в рабочей группе.\n"
+            f"Время решения: {format_event_dt(now, settings)}\n"
+            f"Адресаты: {wait_targets_label(closed_waits)}\n"
+            f"Исходное сообщение: {reference}\n"
+            f"Сумму и детализацию штрафов за месяц можно посмотреть командой /fines."
+        )
+        await edit_reminder_closed(bot, closed_waits[0], group_text)
+        await edit_callback_message(callback, private_text)
+        await safe_callback_answer(callback, "Решение сохранено, сообщение в группе обновлено.")
+        return
 
     if action in {"close", "confirmclose"}:
         closed_waits = await app_storage.close_waits_for_source_messages(
@@ -1403,12 +1641,13 @@ async def notify_leader(
     text: str,
     now: datetime,
     wait: PendingWait | None = None,
-) -> None:
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
     leader = await app_storage.get_user_by_username(settings.leader_username)
     if not leader or not leader["private_chat_started"]:
         logger.warning("Cannot notify leader @%s: private chat is not activated", settings.leader_username)
         await app_storage.record_metric("leader_notification_failed", now=now, wait_id=wait.id if wait else None)
-        return
+        return False
 
     try:
         await bot.send_message(
@@ -1416,13 +1655,15 @@ async def notify_leader(
             text=text,
             disable_web_page_preview=True,
             parse_mode="HTML",
+            reply_markup=reply_markup,
         )
     except TelegramAPIError:
         logger.exception("Cannot notify leader @%s", settings.leader_username)
         await app_storage.record_metric("leader_notification_failed", now=now, wait_id=wait.id if wait else None)
-        return
+        return False
 
     await app_storage.record_metric("leader_notification_sent", now=now, wait_id=wait.id if wait else None)
+    return True
 
 
 async def send_group_reminder(
@@ -1458,18 +1699,35 @@ async def send_group_reminder(
 
     reference = source_reference(wait.source_message_link, wait.source_quote)
     next_reminder_number = reminder_count + 1
+    is_fine_warning = next_reminder_number == 2
+    is_fine_decision = next_reminder_number >= 3
     is_final_after_dm_failure = limit_applies and next_reminder_number >= dm_failure_limit
 
-    if is_final_after_dm_failure:
+    if is_fine_decision:
+        text = (
+            f"{target_labels}, третье напоминание по сообщению: {reference}\n"
+            f"Запрос на решение по штрафу отправлен руководителю {display_username(settings.leader_username)} в личку."
+        )
+        reply_markup = source_link_keyboard(wait)
+    elif is_fine_warning:
+        text = (
+            f"{target_labels}, второе напоминание: нужен ответ по сообщению: {reference}\n"
+            f"Если ответа не будет в течение {settings.reminder_interval_minutes} минут, "
+            f"я отправлю руководителю запрос на штраф {settings.fine_amount_rubles} ₽."
+        )
+        reply_markup = wait_keyboard(wait)
+    elif is_final_after_dm_failure:
         text = (
             f"{target_labels}, финальное напоминание по сообщению: {reference}\n"
             "Пожалуйста, не оставляйте обращения коллег без ответа: "
             "в рабочих чатах это недопустимо и задерживает работу команды."
         )
+        reply_markup = wait_keyboard(wait)
     else:
         text = f"{target_labels}, нужен ответ по сообщению: {reference}"
+        reply_markup = wait_keyboard(wait)
 
-    if not is_final_after_dm_failure and reminder_count >= settings.escalate_after_reminders:
+    if not is_fine_decision and not is_final_after_dm_failure and reminder_count >= settings.escalate_after_reminders:
         text += f"\n{display_username(settings.leader_username)}, подключитесь, пожалуйста."
         for item in source_waits:
             await app_storage.record_metric(
@@ -1486,7 +1744,7 @@ async def send_group_reminder(
         chat_id=wait.chat_id,
         text=text,
         disable_web_page_preview=True,
-        reply_markup=wait_keyboard(wait),
+        reply_markup=reply_markup,
         parse_mode="HTML",
         reply_parameters=ReplyParameters(
             message_id=wait.source_message_id,
@@ -1514,7 +1772,58 @@ async def send_group_reminder(
             username_lower=item.username,
             wait_id=item.id,
         )
-    if is_final_after_dm_failure:
+    if is_fine_decision:
+        chat_title = html.escape(wait.chat_title or str(wait.chat_id))
+        leader_request_text = (
+            f"Нужно решение по штрафу.\n"
+            f"Чат: {chat_title}\n"
+            f"Кто не отвечает: {target_labels}\n"
+            f"Сумма штрафа: {settings.fine_amount_rubles} ₽\n"
+            f"Исходное сообщение: {reference}"
+        )
+        leader_request_sent = await notify_leader(
+            bot,
+            app_storage,
+            settings,
+            leader_request_text,
+            now,
+            wait,
+            reply_markup=fine_decision_keyboard(wait, settings.fine_amount_rubles),
+        )
+        if not leader_request_sent:
+            try:
+                await bot.edit_message_text(
+                    chat_id=wait.chat_id,
+                    message_id=sent_message.message_id,
+                    text=(
+                        f"{target_labels}, третье напоминание по сообщению: {reference}\n"
+                        f"Не удалось отправить запрос на решение по штрафу руководителю в личку. "
+                        f"{display_username(settings.leader_username)}, проверьте, что вы нажали /start в личке с ботом."
+                    ),
+                    disable_web_page_preview=True,
+                    parse_mode="HTML",
+                    reply_markup=source_link_keyboard(wait),
+                )
+            except TelegramAPIError:
+                logger.exception("Cannot edit fine request failure message %s", sent_message.message_id)
+        for item in source_waits:
+            await app_storage.stop_group_reminders(item.id, now)
+            await app_storage.record_metric(
+                "fine_decision_requested",
+                now=now,
+                chat_id=item.chat_id,
+                username_lower=item.username,
+                wait_id=item.id,
+            )
+            if leader_request_sent:
+                await app_storage.record_metric(
+                    "fine_request_dm_sent",
+                    now=now,
+                    chat_id=item.chat_id,
+                    username_lower=item.username,
+                    wait_id=item.id,
+                )
+    elif is_final_after_dm_failure:
         for item in source_waits:
             await app_storage.stop_group_reminders(item.id, now)
             await app_storage.record_metric(
@@ -1635,6 +1944,30 @@ async def send_daily_reports_if_due(bot: Bot, app_storage: Storage, settings: Se
 
     report_date, start_at, end_at = report_period(now, settings)
     chat_ids = await app_storage.chats_with_waits_created_between(start_at=start_at, end_at=end_at)
+
+    if not await app_storage.leader_daily_report_was_sent(report_date=report_date):
+        items_by_chat: dict[int, list[DailyReportItem]] = {}
+        for chat_id in chat_ids:
+            items_by_chat[chat_id] = await app_storage.unanswered_waits_created_between(
+                chat_id=chat_id,
+                start_at=start_at,
+                end_at=end_at,
+            )
+        leader_sent = await notify_leader(
+            bot,
+            app_storage,
+            settings,
+            leader_daily_report_text(report_date, items_by_chat),
+            now,
+        )
+        if leader_sent:
+            await app_storage.mark_leader_daily_report_sent(report_date=report_date, sent_at=now)
+            await app_storage.record_metric(
+                "leader_daily_report_sent",
+                now=now,
+                value=1,
+            )
+
     for chat_id in chat_ids:
         if await app_storage.daily_report_was_sent(chat_id=chat_id, report_date=report_date):
             continue
