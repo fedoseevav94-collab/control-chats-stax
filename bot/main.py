@@ -25,7 +25,7 @@ from aiogram.types import (
 )
 
 from bot.config import Settings, load_settings
-from bot.storage import DailyReportItem, FineReportDetail, PendingWait, Storage
+from bot.storage import DailyReportItem, EmployeeStats, FineReportDetail, PendingWait, Storage, WaitEvent
 from bot.telegram_utils import (
     MentionTarget,
     build_message_link,
@@ -95,6 +95,7 @@ def commands_help_text(settings: Settings, user: User | None) -> str:
                 "",
                 "Команды руководителя:",
                 "/stats — статистика работы бота.",
+                "/stats @username — статистика сотрудника.",
                 "/settings — текущие настройки, которые бот видит на сервере.",
                 "/fines — штрафы за текущий месяц с детализацией.",
                 "/fines 2026-05 — штрафы за выбранный месяц.",
@@ -162,16 +163,15 @@ def wait_targets_label(waits: list[PendingWait]) -> str:
     return ", ".join(labels)
 
 
-def wait_keyboard(wait: PendingWait) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(text="Закрыть", callback_data=f"wait:close:{wait.id}"),
-            InlineKeyboardButton(text="Отложить", callback_data=f"wait:snooze:{wait.id}"),
+def wait_keyboard(wait: PendingWait, settings: Settings | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👀 Вижу", callback_data=f"wait:seen:{wait.id}"),
+                InlineKeyboardButton(text="Закрыть", callback_data=f"wait:close:{wait.id}"),
+            ]
         ]
-    ]
-    if wait.source_message_link:
-        buttons.append([InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 def source_link_keyboard(wait: PendingWait) -> InlineKeyboardMarkup | None:
@@ -182,24 +182,12 @@ def source_link_keyboard(wait: PendingWait) -> InlineKeyboardMarkup | None:
     )
 
 
-def answer_confirmation_keyboard(wait: PendingWait) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Считать ответом", callback_data=f"wait:confirmclose:{wait.id}"),
-                InlineKeyboardButton(text="Продолжить контроль", callback_data=f"wait:keep:{wait.id}"),
-            ]
-        ]
-    )
-
-
-def fine_decision_keyboard(wait: PendingWait, fine_amount: int) -> InlineKeyboardMarkup:
-    buttons = [
-        [
-            InlineKeyboardButton(text=f"Выписать штраф {fine_amount} ₽", callback_data=f"wait:fine:{wait.id}"),
-            InlineKeyboardButton(text="Не штрафовать", callback_data=f"wait:nofine:{wait.id}"),
-        ]
-    ]
+def leader_decision_keyboard(wait: PendingWait, fine_amount: int, *, enable_warning: bool = True) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="✅ Закрыть без штрафа", callback_data=f"wait:closeok:{wait.id}")]]
+    if enable_warning:
+        buttons.append([InlineKeyboardButton(text="⚠️ Предупреждение", callback_data=f"wait:warning:{wait.id}")])
+    buttons.append([InlineKeyboardButton(text=f"💰 Назначить штраф {fine_amount} ₽", callback_data=f"wait:fine:{wait.id}")])
+    buttons.append([InlineKeyboardButton(text="🚫 Не штрафовать", callback_data=f"wait:nofine:{wait.id}")])
     if wait.source_message_link:
         buttons.append([InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -210,8 +198,145 @@ def normalized_message_text(message: Message) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def message_requires_response(message: Message, targets: list[MentionTarget]) -> bool:
+    if not targets:
+        return False
+
+    text = normalized_message_text(message)
+    if not text:
+        return bool(message.photo or message.document or message.video)
+
+    normalized = normalized_match_text(text)
+    mentions_only = normalized
+    for target in targets:
+        labels = [target.display_name, target.username or "", display_username(target.username) if target.username else ""]
+        for label in labels:
+            if label:
+                mentions_only = mentions_only.replace(normalized_match_text(label), " ")
+    mentions_only = re.sub(r"@\w+", " ", mentions_only)
+    mentions_only = re.sub(r"\s+", " ", mentions_only).strip(" ,.!?:;—-")
+
+    if not mentions_only:
+        return False
+
+    if any(phrase in normalized for phrase in NON_REQUEST_PHRASES) and not any(
+        phrase in normalized for phrase in RESPONSE_REQUEST_PHRASES
+    ):
+        return False
+
+    if any(phrase in normalized for phrase in RESPONSE_REQUEST_PHRASES):
+        return True
+
+    # Vehicle/task-style messages often omit a question mark but still assign work.
+    if re.search(r"\b[а-яa-z]\d{3,4}[а-яa-z]{2}\d{2,3}\b", normalized):
+        return True
+
+    return False
+
+
 def normalized_match_text(value: str) -> str:
     return re.sub(r"\s+", " ", value.replace("ё", "е").casefold()).strip()
+
+
+DELAY_REASONS = {
+    "drive": "🚗 Был за рулём",
+    "call": "📞 Был на созвоне",
+    "client": "👥 Общался с клиентом",
+    "urgent": "⚠️ Срочная задача",
+    "not_seen": "😴 Не видел сообщение",
+    "answered_not_seen": "✅ Ответил, бот не увидел",
+    "other": "📝 Другое",
+}
+
+AMBIGUOUS_RESPONSE_EXACT = {
+    "ок", "окей", "+", "++", "понял", "принял", "ага", "угу", "ща", "сейчас",
+    "сек", "мин", "позже", "потом", "добро", "ясно", "вижу", "услышал",
+    "на связи", "ладно", "хорошо",
+}
+
+INTERMEDIATE_RESPONSE_PHRASES = (
+    "смотрю", "посмотрю", "сейчас посмотрю", "гляну", "сейчас гляну",
+    "проверяю", "сейчас проверяю", "уточняю", "сейчас уточню", "разбираюсь",
+    "сейчас разберусь", "взял в работу", "принял в работу", "сейчас займусь",
+    "займусь", "после созвона отвечу", "после встречи отвечу", "после клиента отвечу",
+    "после поездки отвечу", "после доставки отвечу", "после обеда отвечу",
+    "чуть позже отвечу", "позже отвечу", "скоро отвечу", "вернусь с ответом",
+    "дам ответ позже", "дам ответ чуть позже", "нужно время", "нужно проверить",
+    "нужно уточнить", "нужно посмотреть", "нужно разобраться", "занят, но вернусь",
+    "на созвоне", "на встрече", "за рулем", "за рулём", "с клиентом", "в дороге",
+    "сейчас не могу", "понял, проверю", "ок, проверю", "ок, посмотрю",
+    "ок, уточню", "ок, разберусь", "принял, проверю", "принял, уточню",
+    "принял, посмотрю", "принял, разберусь", "секунду", "минуту",
+    "щас посмотрю", "сейчас отпишусь", "сейчас дам ответ", "сейчас будет ответ",
+    "пока уточняю", "пока проверяю", "уже смотрю", "уже проверяю",
+    "уже занимаюсь", "в процессе", "в работе", "на контроле", "держу в голове",
+    "не забыл", "не игнорю", "освобожусь", "дай 10 минут", "дай 15 минут",
+    "дай 30 минут", "через 10 минут", "через 15 минут", "через 30 минут",
+    "до конца дня отвечу", "сегодня отвечу", "уточню у клиента", "уточню у водителя",
+    "уточню у бухгалтера", "уточню у менеджера", "уточню у руководителя",
+    "жду информацию", "жду подтверждение", "жду ответ", "жду документы", "жду оплату",
+    "жду фото", "жду данные", "запросил информацию", "запросил документы",
+    "запросил подтверждение", "сейчас узнаю", "узнаю и отвечу",
+    "проверю и отвечу", "посмотрю и отвечу", "разберусь и отвечу",
+    "сначала проверю", "сначала уточню", "надо сверить", "надо проверить",
+)
+
+FULL_RESPONSE_PHRASES = (
+    "сделал", "готово", "выполнил", "отправил", "передал", "проверил",
+    "уточнил", "разобрался", "закрыл вопрос", "вопрос закрыт", "задача выполнена",
+    "документы отправил", "документы проверил", "документы готовы", "оплату проверил",
+    "оплата пришла", "оплаты нет", "деньги поступили", "деньги не поступили",
+    "клиенту написал", "клиенту позвонил", "с клиентом связался", "клиент подтвердил",
+    "клиент отказался", "клиент ждет", "клиент ждёт", "клиент оплатил",
+    "клиент не отвечает", "водителю написал", "водителю позвонил", "водитель подтвердил",
+    "водитель не отвечает", "машину проверил", "машина готова", "машина в ремонте",
+    "машина на линии", "машина свободна", "машина занята", "фото отправил",
+    "видео отправил", "скрин отправил", "ссылку отправил", "файл отправил",
+    "договор отправил", "акт отправил", "счет отправил", "счёт отправил",
+    "заявку создал", "заявку закрыл", "заявку обновил", "в базу внес", "в базу внёс",
+    "в таблицу внес", "в таблицу внёс", "в crm внес", "в crm внёс",
+    "исправил", "переделал", "обновил", "созвонился", "договорился",
+    "согласовал", "подтвердил", "отменил", "перенес", "перенёс", "записал",
+    "назначил", "добавил", "удалил", "заменил", "оплатил", "выставил счет",
+    "выставил счёт", "отправил счет", "отправил счёт", "отправил реквизиты",
+    "получил подтверждение", "ответил клиенту", "ответил в чат", "ответил в личку",
+    "решил вопрос", "проблему решил", "ошибку исправил", "все сделал", "всё сделал",
+    "все готово", "всё готово", "все отправил", "всё отправил",
+    "все проверил", "всё проверил", "все подтвердил", "всё подтвердил",
+    "все согласовано", "всё согласовано", "можно закрывать", "закрывай",
+    "готово, закрывай", "да, сделал", "да, отправил", "да, проверил",
+    "да, подтвердил", "нет, не пришло", "нет, не готово", "нет, клиент не ответил",
+    "нет, оплаты нет", "да, оплата есть", "да, документы готовы", "да, машина готова",
+    "да, водитель подтвердил", "подтверждаю", "не подтверждаю", "отказ",
+    "согласовано", "не согласовано", "принято", "не принято", "передал в работу",
+    "передал ответственному", "назначил ответственного", "решение принято",
+    "решили так", "ответ:", "итог:", "по итогу:", "статус: готово",
+    "статус: проверено", "статус: отправлено", "статус: оплачено",
+    "статус: не оплачено", "статус: в ремонте", "статус: отменено",
+)
+
+RESPONSE_REQUEST_PHRASES = (
+    "?", "когда", "где", "почему", "зачем", "как", "какой", "какая", "какие",
+    "сколько", "что по", "что с", "нужен ответ", "нужна обратная связь",
+    "ответьте", "ответь", "отпишитесь", "отпишись", "сообщите", "сообщи",
+    "уточните", "уточни", "проверьте", "проверь", "посмотрите", "посмотри",
+    "глянь", "гляньте", "разберитесь", "разберись", "подскажите", "подскажи",
+    "подтвердите", "подтверди", "согласуйте", "согласуй", "свяжитесь", "свяжись",
+    "позвоните", "позвони", "напишите", "напиши", "пришлите", "пришли",
+    "скиньте", "скинь", "отправьте", "отправь", "передайте", "передай",
+    "сделайте", "сделай", "оформите", "оформи", "оплатите", "оплати",
+    "создайте", "создай", "закройте", "закрой", "обновите", "обнови",
+    "исправьте", "исправь", "добавьте", "добавь", "замените", "замени",
+    "пригласите", "пригласи", "подключитесь", "подключись", "возьмите", "возьми",
+    "нужно", "нужен", "нужна", "нужны", "надо", "необходимо", "требуется",
+    "можешь", "можете", "можно", "просьба", "прошу", "пожалуйста",
+    "в работу", "на контроль", "на контроле", "ждем ответ", "ждём ответ",
+)
+
+NON_REQUEST_PHRASES = (
+    "спасибо", "благодарю", "доброе утро", "добрый день", "добрый вечер",
+    "хорошего дня", "хорошего вечера", "привет", "здравствуйте", "извините",
+)
 
 
 def text_contains_standalone_name(text: str, name: str) -> bool:
@@ -262,6 +387,10 @@ def wait_matches_telegram_user(wait: PendingWait, user: User | None) -> bool:
         return True
 
     return wait_matches_sender_display(wait, user)
+
+
+def can_user_control_waits(waits: list[PendingWait], user: User | None, settings: Settings) -> bool:
+    return is_leader(user, settings) or any(wait_matches_telegram_user(wait, user) for wait in waits)
 
 
 async def resolve_user_id_for_matching_waits(
@@ -382,35 +511,37 @@ async def extend_targets_from_known_names(
     return sorted(targets_by_identity.values(), key=lambda target: target.display_name.lower())
 
 
-def is_unclear_employee_response(message: Message) -> bool:
+def response_contains_phrase(normalized: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in normalized for phrase in phrases)
+
+
+def classify_employee_response(message: Message, settings: Settings | None = None) -> str:
     text = normalized_message_text(message)
     if not text:
-        return False
+        return "full" if (message.photo or message.document or message.video or message.voice or message.audio) else "empty"
 
-    normalized = text.lower().replace("ё", "е")
-    if UNCLEAR_RESPONSE_RE.match(normalized):
-        return True
+    normalized = normalized_match_text(text)
+    compact = normalized.strip(" .,!?:;—-…")
+    if compact in AMBIGUOUS_RESPONSE_EXACT:
+        return "ambiguous"
 
-    unclear_fragments = (
-        "позже",
-        "потом",
-        "посмотрю",
-        "уточню",
-        "разберусь",
-        "отпишусь",
-        "не мой вопрос",
-        "не ко мне",
-        "не знаю",
-        "не в курсе",
-    )
-    return any(fragment in normalized for fragment in unclear_fragments)
+    if settings is None or settings.enable_smart_reply_detection:
+        if response_contains_phrase(normalized, FULL_RESPONSE_PHRASES):
+            return "full"
+        if response_contains_phrase(normalized, INTERMEDIATE_RESPONSE_PHRASES):
+            return "intermediate"
+
+    if len(compact) <= 12 and compact in AMBIGUOUS_RESPONSE_EXACT:
+        return "ambiguous"
+    return "full"
+
+
+def is_unclear_employee_response(message: Message) -> bool:
+    return classify_employee_response(message) == "ambiguous"
 
 
 def is_meaningful_employee_response(message: Message) -> bool:
-    text = normalized_message_text(message)
-    if not text:
-        return bool(message.photo or message.document or message.video or message.voice or message.audio)
-    return not is_unclear_employee_response(message)
+    return classify_employee_response(message) == "full"
 
 
 SOURCE_MATCH_STOPWORDS = {
@@ -1174,6 +1305,45 @@ async def stats_command(message: Message, app_storage: Storage, settings: Settin
         await message.answer("Статистика доступна только руководителю.")
         return
 
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) > 1:
+        username = parts[1].strip().removeprefix("@").lower()
+        known_user = await app_storage.get_user_by_username(username)
+        stats = await app_storage.employee_stats(
+            username_lower=username,
+            user_id=known_user["user_id"] if known_user else None,
+            now=now_in_tz(settings),
+        )
+        display = stats.display_name or display_username(username)
+        avg = "нет данных"
+        if stats.avg_response_seconds_7d:
+            now = now_in_tz(settings)
+            avg = format_elapsed(now - timedelta(seconds=stats.avg_response_seconds_7d), now)
+        reason_lines = [f"— {reason}: {count}" for reason, count in stats.delay_reasons_7d.items()] or ["— нет"]
+        await message.answer(
+            "\n".join(
+                [
+                    f"Статистика по {html.escape(display)}:",
+                    "",
+                    "За 7 дней:",
+                    f"— обращений: {stats.requests_7d}",
+                    f"— закрыто вовремя: {stats.closed_on_time_7d}",
+                    f"— просрочек: {stats.overdue_7d}",
+                    f"— предупреждений за месяц: {stats.warnings_month}",
+                    f"— штрафов за месяц: {stats.fines_month}",
+                    f"— среднее время ответа: {avg}",
+                    f"— нажимал «Вижу»: {stats.seen_count_7d}",
+                    f"— выбирал «Ответил, бот не увидел»: {stats.answered_not_seen_count_7d}",
+                    f"— подтверждённых ошибок бота за месяц: {stats.bot_missed_confirmed_month}",
+                    "",
+                    "Причины задержек:",
+                    *reason_lines,
+                ]
+            ),
+            parse_mode="HTML",
+        )
+        return
+
     summary = await app_storage.metrics_summary()
     await message.answer(
         "\n".join(
@@ -1181,23 +1351,17 @@ async def stats_command(message: Message, app_storage: Storage, settings: Settin
                 "Статистика бота:",
                 f"Активные ожидания: {summary.get('active_waits', 0)}",
                 f"Создано/обновлено ожиданий: {summary.get('wait_upserted', 0)}",
-                f"Закрыто ответом: {summary.get('wait_closed_by_message', 0)}",
                 f"Закрыто reply-ом: {summary.get('wait_closed_by_reply', 0)}",
                 f"Закрыто реакцией: {summary.get('wait_closed_by_reaction', 0)}",
                 f"Закрыто кнопкой: {summary.get('wait_closed_by_button', 0)}",
-                f"Закрыто подтверждением: {summary.get('wait_closed_by_confirm_button', 0)}",
-                f"Отложено кнопкой: {summary.get('wait_snoozed_by_button', 0)}",
-                f"Спорных ответов: {summary.get('wait_response_unclear', 0)}",
-                f"Неоднозначных ответов: {summary.get('wait_response_ambiguous', 0)}",
+                f"Нажали «Вижу»: {summary.get('wait_seen', 0)}",
+                f"Запрошено решений руководителя: {summary.get('leader_decision_requested', 0)}",
+                f"Предупреждений: {summary.get('warning_issued', 0)}",
+                f"Штрафов назначено: {summary.get('fine_issued', 0)}",
+                f"Штрафов отклонено: {summary.get('fine_declined', 0)}",
                 f"Оставлено под контролем: {summary.get('wait_kept_by_confirm_button', 0)}",
                 f"Переадресовано: {summary.get('wait_delegated', 0)}",
                 f"Групповых напоминаний: {summary.get('group_reminder_sent', 0)}",
-                f"Запрошено решений по штрафу: {summary.get('fine_decision_requested', 0)}",
-                f"Штрафов назначено: {summary.get('fine_issued', 0)}",
-                f"Штрафов отклонено: {summary.get('fine_declined', 0)}",
-                f"Запросов по штрафу отправлено в личку: {summary.get('fine_request_dm_sent', 0)}",
-                f"Остановлено после лимита: {summary.get('group_reminders_stopped_after_dm_failure', 0)}",
-                f"Эскалаций руководителю: {summary.get('leader_escalation_sent', 0)}",
                 f"Личных сообщений отправлено: {summary.get('direct_message_sent', 0)}",
                 f"Личных сообщений не отправлено: {summary.get('direct_message_failed', 0)}",
                 f"Всего закрытых ожиданий в базе: {summary.get('closed_waits_total', 0)}",
@@ -1224,6 +1388,10 @@ async def settings_command(message: Message, app_storage: Storage, settings: Set
                 f"Отчёт каждый день: {settings.daily_report_time.strftime('%H:%M')}",
                 f"Руководитель: {display_username(settings.leader_username)}",
                 f"Штраф: {settings.fine_amount_rubles} ₽",
+                f"Отсрочка по кнопке «Вижу»: {settings.seen_delay_minutes} мин.",
+                "Закрытие ответом: только reply на исходное обращение или напоминание бота",
+                "Кнопки в напоминании: 👀 Вижу и Закрыть",
+                f"Предупреждения: {'включено' if settings.enable_warning_decision else 'выключено'}",
                 f"База данных: {settings.database_path}",
             ]
         )
@@ -1287,55 +1455,45 @@ async def text_action_command(message: Message, bot: Bot, app_storage: Storage, 
         await message.reply("Активное ожидание для этого напоминания уже не найдено.")
         return
 
-    now = now_in_tz(settings)
-    if command_text == "закрыть":
-        closed_waits = await app_storage.close_waits_for_source_messages(
-            chat_id=wait.chat_id,
-            source_message_ids=[wait.source_message_id],
-            closed_by_user_id=message.from_user.id,
-            now=now,
-        )
-        if closed_waits:
-            await app_storage.record_metric(
-                "wait_closed_by_text_command",
-                now=now,
-                chat_id=wait.chat_id,
-                username_lower=wait.username,
-                wait_id=wait.id,
-                value=len(closed_waits),
-            )
-            await mark_waits_closed(
-                bot,
-                closed_waits,
-                actor_label(message.from_user),
-                "закрыл обращение",
-                message.date,
-                settings,
-                time_label="Время закрытия",
-            )
+    if command_text == "отложить":
+        await message.reply("Отложить можно кнопкой «👀 Вижу» у адресата обращения.")
         return
 
-    next_at = add_working_minutes(
-        now,
-        settings.reminder_interval_minutes,
-        settings.workday_start,
-        settings.workday_end,
-        settings.timezone,
+    source_waits = await app_storage.active_waits_for_source_message(
+        chat_id=wait.chat_id,
+        source_message_id=wait.source_message_id,
     )
-    snoozed_waits = await app_storage.reschedule_waits_for_source_messages(
+    source_waits = source_waits or [wait]
+    if not can_user_control_waits(source_waits, message.from_user, settings):
+        await message.reply("Закрыть обращение может руководитель или адресат обращения.")
+        return
+
+    now = now_in_tz(settings)
+    await resolve_user_id_for_matching_waits(app_storage, source_waits, message.from_user)
+    closed_waits = await app_storage.close_waits_for_source_messages(
         chat_id=wait.chat_id,
         source_message_ids=[wait.source_message_id],
-        next_reminder_at=next_at,
-    )
-    await app_storage.record_metric(
-        "wait_snoozed_by_text_command",
+        closed_by_user_id=message.from_user.id,
         now=now,
-        chat_id=wait.chat_id,
-        username_lower=wait.username,
-        wait_id=wait.id,
-        value=max(len(snoozed_waits), 1),
     )
-    await mark_waits_snoozed(bot, snoozed_waits or [wait], next_at, settings)
+    if closed_waits:
+        await app_storage.record_metric(
+            "wait_closed_by_text_command",
+            now=now,
+            chat_id=wait.chat_id,
+            username_lower=wait.username,
+            wait_id=wait.id,
+            value=len(closed_waits),
+        )
+        await mark_waits_closed(
+            bot,
+            closed_waits,
+            actor_label(message.from_user),
+            "закрыл обращение",
+            message.date,
+            settings,
+            time_label="Время закрытия",
+        )
 
 
 async def close_waits_after_employee_message(
@@ -1409,33 +1567,124 @@ async def create_delegated_waits(
         logger.info("Delegated wait from user %s to %s in chat %s", sender_id, target.identity, message.chat.id)
 
 
-async def ask_to_confirm_response(
+async def record_employee_message_events(
+    app_storage: Storage,
+    waits: list[PendingWait],
+    message: Message,
+    *,
+    event_type: str,
+    now: datetime,
+) -> None:
+    if not waits:
+        return
+    await app_storage.record_wait_events(
+        waits,
+        event_type=event_type,
+        created_at=now,
+        actor_user_id=message.from_user.id if message.from_user else None,
+        actor_label=actor_label(message.from_user),
+        text=normalized_message_text(message),
+    )
+
+
+async def postpone_source_waits(
+    app_storage: Storage,
+    *,
+    chat_id: int,
+    source_message_ids: list[int],
+    now: datetime,
+    delay_minutes: int,
+    settings: Settings,
+    mode: str,
+    actor_user_id: int | None = None,
+) -> list[PendingWait]:
+    next_at = add_working_minutes(
+        now,
+        delay_minutes,
+        settings.workday_start,
+        settings.workday_end,
+        settings.timezone,
+    )
+    if mode == "seen" and actor_user_id is not None:
+        return await app_storage.mark_source_seen(
+            chat_id=chat_id,
+            source_message_ids=source_message_ids,
+            seen_by_user_id=actor_user_id,
+            seen_at=now,
+            next_reminder_at=next_at,
+        )
+    if mode == "intermediate":
+        return await app_storage.mark_source_intermediate(
+            chat_id=chat_id,
+            source_message_ids=source_message_ids,
+            intermediate_at=now,
+            next_reminder_at=next_at,
+        )
+    return await app_storage.reschedule_waits_for_source_messages(
+        chat_id=chat_id,
+        source_message_ids=source_message_ids,
+        next_reminder_at=next_at,
+    )
+
+
+async def handle_intermediate_response(
+    bot: Bot,
     app_storage: Storage,
     message: Message,
     waits: list[PendingWait],
     now: datetime,
-    *,
-    metric_name: str,
+    settings: Settings,
 ) -> None:
-    for source_waits in group_waits_by_source(waits):
-        wait = source_waits[0]
-        await message.reply(
-            (
-                f"{wait_targets_label(source_waits)}, считать это ответом по сообщению: "
-                f"{source_reference(wait.source_message_link, wait.source_quote)}"
-            ),
-            disable_web_page_preview=True,
-            parse_mode="HTML",
-            reply_markup=answer_confirmation_keyboard(wait),
-        )
-        for source_wait in source_waits:
-            await app_storage.record_metric(
-                metric_name,
-                now=now,
-                chat_id=message.chat.id,
-                username_lower=source_wait.username,
-                wait_id=source_wait.id,
-            )
+    source_message_ids = [wait.source_message_id for wait in waits]
+    updated_waits = await postpone_source_waits(
+        app_storage,
+        chat_id=message.chat.id,
+        source_message_ids=source_message_ids,
+        now=now,
+        delay_minutes=settings.smart_reply_delay_minutes,
+        settings=settings,
+        mode="intermediate",
+    )
+    await record_employee_message_events(app_storage, updated_waits or waits, message, event_type="intermediate_answer", now=now)
+    await app_storage.record_metric(
+        "wait_intermediate_answer",
+        now=now,
+        chat_id=message.chat.id,
+        username_lower=waits[0].username if waits else None,
+        value=max(len(updated_waits), 1),
+    )
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=(
+            f"{actor_label(message.from_user)} подтвердил, что занимается вопросом.\n"
+            "Ждём полноценный ответ."
+        ),
+        parse_mode="HTML",
+        reply_parameters=ReplyParameters(message_id=waits[0].source_message_id, allow_sending_without_reply=True),
+    )
+
+
+def answer_found_in_events(events: list[WaitEvent], wait: PendingWait) -> bool:
+    for event in events:
+        if event.event_type in {"full_answer", "reaction", "closed_by_reply", "closed_by_message"}:
+            return True
+        if event.event_type == "employee_message" and event.text:
+            if classify_text_as_response(event.text) == "full" or source_text_match_score(event.text, wait) >= 2:
+                return True
+    return False
+
+
+def classify_text_as_response(text: str) -> str:
+    fake_message = type("FakeMessage", (), {
+        "text": text,
+        "caption": None,
+        "photo": None,
+        "document": None,
+        "video": None,
+        "voice": None,
+        "audio": None,
+    })()
+    return classify_employee_response(fake_message)
 
 
 @router.message(F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}))
@@ -1446,19 +1695,19 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     sender_username = message.from_user.username.lower() if message.from_user and message.from_user.username else None
     sender_id = message.from_user.id if message.from_user else None
 
-    detected_targets = await extend_targets_from_known_names(
-        app_storage,
-        message,
-        extract_mention_targets(message),
-    )
+    # New waits must start only from explicit Telegram mentions: @username,
+    # text_mention, or tg://user links. Plain names in normal text are used only
+    # to match already active waits, not to create new control tasks.
+    explicit_targets = extract_mention_targets(message)
     mention_targets = [
         target
-        for target in detected_targets
+        for target in explicit_targets
         if not (
             (sender_id is not None and target.user_id == sender_id)
             or (sender_username is not None and target.identity == sender_username)
         )
     ]
+    actionable_mention_targets = mention_targets if message_requires_response(message, mention_targets) else []
 
     sender_waits = await active_waits_for_sender(
         app_storage,
@@ -1467,10 +1716,16 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         username_lower=sender_username,
     )
     reply_source_waits: list[PendingWait] = []
-    if message.reply_to_message:
+    if message.reply_to_message or getattr(message, "quote", None) or getattr(message, "external_reply", None):
         reply_source_waits = await active_waits_for_reply(app_storage, message)
 
-    if reply_source_waits and mention_targets:
+    tracked_waits = reply_source_waits or sender_waits
+    if tracked_waits and normalized_message_text(message):
+        await record_employee_message_events(app_storage, tracked_waits, message, event_type="employee_message", now=now)
+
+    if reply_source_waits and actionable_mention_targets:
+        if not can_user_control_waits(reply_source_waits, message.from_user, settings):
+            return
         await close_waits_after_employee_message(
             bot,
             app_storage,
@@ -1484,35 +1739,14 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
             app_storage,
             message,
             settings,
-            mention_targets,
+            actionable_mention_targets,
             now,
             source_waits_count=len(reply_source_waits),
         )
         return
 
-    if sender_waits and mention_targets:
-        delegated_waits = select_waits_answered_by_message(sender_waits, message)
-        if delegated_waits:
-            await close_waits_after_employee_message(
-                bot,
-                app_storage,
-                message,
-                delegated_waits,
-                now,
-                metric_name="wait_delegated_from_message",
-                reason="переадресовал вопрос",
-            )
-            await create_delegated_waits(
-                app_storage,
-                message,
-                settings,
-                mention_targets,
-                now,
-                source_waits_count=len(delegated_waits),
-            )
-            return
-
-        for target in mention_targets:
+    if sender_waits and actionable_mention_targets:
+        for target in actionable_mention_targets:
             await create_wait_for_target(
                 app_storage,
                 message,
@@ -1524,7 +1758,10 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
             logger.info("Created wait for %s in chat %s; sender waits left active", target.identity, message.chat.id)
         return
 
-    if reply_source_waits and is_meaningful_employee_response(message):
+    if reply_source_waits:
+        if not can_user_control_waits(reply_source_waits, message.from_user, settings):
+            return
+        await record_employee_message_events(app_storage, reply_source_waits, message, event_type="full_answer", now=now)
         await close_waits_after_employee_message(
             bot,
             app_storage,
@@ -1536,43 +1773,13 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         )
         return
 
-    if sender_waits and is_meaningful_employee_response(message):
-        answered_waits = select_waits_answered_by_message(sender_waits, message)
-        if answered_waits:
-            await close_waits_after_employee_message(
-                bot,
-                app_storage,
-                message,
-                answered_waits,
-                now,
-                metric_name="wait_closed_by_message",
-                reason="ответил",
-            )
-            return
-
-        await ask_to_confirm_response(
-            app_storage,
-            message,
-            sender_waits,
-            now,
-            metric_name="wait_response_ambiguous",
-        )
-        return
-
     if sender_waits:
-        await ask_to_confirm_response(
-            app_storage,
-            message,
-            sender_waits,
-            now,
-            metric_name="wait_response_unclear",
-        )
         return
 
-    if not mention_targets:
+    if not actionable_mention_targets:
         return
 
-    for target in mention_targets:
+    for target in actionable_mention_targets:
         await create_wait_for_target(
             app_storage,
             message,
@@ -1637,6 +1844,14 @@ async def handle_message_reaction(
     if not closed_waits:
         return
 
+    await app_storage.record_wait_events(
+        closed_waits,
+        event_type="reaction",
+        created_at=now,
+        actor_user_id=event.user.id,
+        actor_label=actor_label(event.user),
+        text="reaction",
+    )
     username = event.user.username.lower() if event.user.username else None
     await app_storage.record_metric(
         "wait_closed_by_reaction",
@@ -1670,11 +1885,137 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         now=now,
     )
 
-    if action in {"fine", "nofine"}:
+    if action == "seen":
+        source_waits = await app_storage.active_waits_for_source_message(
+            chat_id=wait.chat_id,
+            source_message_id=wait.source_message_id,
+        )
+        if not any(wait_matches_telegram_user(item, callback.from_user) for item in source_waits):
+            await safe_callback_answer(callback, "Кнопка «Вижу» доступна адресату обращения.", show_alert=True)
+            return
+        await resolve_user_id_for_matching_waits(app_storage, source_waits, callback.from_user)
+        updated_waits = await postpone_source_waits(
+            app_storage,
+            chat_id=wait.chat_id,
+            source_message_ids=[wait.source_message_id],
+            now=now,
+            delay_minutes=settings.seen_delay_minutes,
+            settings=settings,
+            mode="seen",
+            actor_user_id=callback.from_user.id,
+        )
+        await app_storage.record_wait_events(
+            updated_waits or source_waits,
+            event_type="seen",
+            created_at=now,
+            actor_user_id=callback.from_user.id,
+            actor_label=actor_label(callback.from_user),
+            text=source_reference(wait.source_message_link, wait.source_quote),
+        )
+        await app_storage.record_metric(
+            "wait_seen",
+            now=now,
+            chat_id=wait.chat_id,
+            username_lower=wait.username,
+            wait_id=wait.id,
+            value=max(len(updated_waits), 1),
+        )
+        await bot.send_message(
+            chat_id=wait.chat_id,
+            text=(
+                f"{actor_label(callback.from_user)} увидел обращение.\n"
+                f"Даём дополнительные {settings.seen_delay_minutes} минут на ответ."
+            ),
+            parse_mode="HTML",
+            reply_parameters=ReplyParameters(message_id=wait.source_message_id, allow_sending_without_reply=True),
+        )
+        await safe_callback_answer(callback, "Зафиксировал: увидел.")
+        return
+
+    if action.startswith("reason_"):
+        reason_key = action.removeprefix("reason_")
+        source_waits = await app_storage.active_waits_for_source_message(
+            chat_id=wait.chat_id,
+            source_message_id=wait.source_message_id,
+        )
+        if not any(wait_matches_telegram_user(item, callback.from_user) for item in source_waits):
+            await safe_callback_answer(callback, "Причину может указать адресат обращения.", show_alert=True)
+            return
+        await resolve_user_id_for_matching_waits(app_storage, source_waits, callback.from_user)
+        updated_waits = await app_storage.set_delay_reason_for_source(
+            chat_id=wait.chat_id,
+            source_message_ids=[wait.source_message_id],
+            reason=reason_key,
+            reason_at=now,
+        )
+        await app_storage.record_wait_events(
+            updated_waits or source_waits,
+            event_type="reason_answered_not_seen" if reason_key == "answered_not_seen" else "delay_reason",
+            created_at=now,
+            actor_user_id=callback.from_user.id,
+            actor_label=actor_label(callback.from_user),
+            text=reason_label(reason_key),
+        )
+        await app_storage.record_metric(
+            "delay_reason_selected",
+            now=now,
+            chat_id=wait.chat_id,
+            username_lower=wait.username,
+            wait_id=wait.id,
+            value=max(len(updated_waits), 1),
+        )
+        if reason_key == "answered_not_seen":
+            events = await app_storage.wait_events_for_source(chat_id=wait.chat_id, source_message_id=wait.source_message_id)
+            if answer_found_in_events(events, wait):
+                closed_waits = await app_storage.close_waits_for_source_messages(
+                    chat_id=wait.chat_id,
+                    source_message_ids=[wait.source_message_id],
+                    closed_by_user_id=callback.from_user.id,
+                    now=now,
+                )
+                if closed_waits:
+                    await mark_waits_closed(
+                        bot,
+                        closed_waits,
+                        actor_label(callback.from_user),
+                        "ответ найден после проверки",
+                        now,
+                        settings,
+                        time_label="Время проверки",
+                    )
+                    await bot.send_message(
+                        chat_id=wait.chat_id,
+                        text="Ответ сотрудника найден.\nОбращение закрыто.",
+                        reply_parameters=ReplyParameters(message_id=wait.source_message_id, allow_sending_without_reply=True),
+                    )
+                await safe_callback_answer(callback, "Ответ найден, обращение закрыто.")
+                return
+            await bot.send_message(
+                chat_id=wait.chat_id,
+                text=(
+                    "Бот не смог автоматически найти ответ.\n"
+                    "Запрос отправлен руководителю на ручную проверку."
+                ),
+                reply_parameters=ReplyParameters(message_id=wait.source_message_id, allow_sending_without_reply=True),
+            )
+            await send_leader_decision_request(bot, app_storage, settings, updated_waits or source_waits, now, manual_review=True)
+            await safe_callback_answer(callback, "Передал руководителю на проверку.")
+            return
+
+        await bot.send_message(
+            chat_id=wait.chat_id,
+            text=f"Причина задержки принята: {html.escape(reason_label(reason_key))}.",
+            parse_mode="HTML",
+            reply_parameters=ReplyParameters(message_id=wait.source_message_id, allow_sending_without_reply=True),
+        )
+        await safe_callback_answer(callback, "Причина сохранена.")
+        return
+
+    if action in {"fine", "nofine", "warning", "closeok"}:
         if not is_leader(callback.from_user, settings):
             await safe_callback_answer(
                 callback,
-                f"Решение по штрафу может принять только {display_username(settings.leader_username)}.",
+                f"Решение может принять только {display_username(settings.leader_username)}.",
                 show_alert=True,
             )
             return
@@ -1689,7 +2030,13 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
             await safe_callback_answer(callback, "Ожидание уже закрыто.", show_alert=False)
             return
 
-        decision = "issued" if action == "fine" else "declined"
+        decision_map = {
+            "fine": "issued",
+            "warning": "warning",
+            "nofine": "declined",
+            "closeok": "manual_answer_confirmed",
+        }
+        decision = decision_map[action]
         amount = settings.fine_amount_rubles if action == "fine" else 0
         await app_storage.record_fine_decisions(
             waits=closed_waits,
@@ -1698,8 +2045,21 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
             decided_by_user_id=callback.from_user.id,
             decided_at=now,
         )
+        await app_storage.record_wait_events(
+            closed_waits,
+            event_type=f"leader_decision_{decision}",
+            created_at=now,
+            actor_user_id=callback.from_user.id,
+            actor_label=actor_label(callback.from_user),
+            text=reason_label(wait.delay_reason),
+        )
         await app_storage.record_metric(
-            "fine_issued" if action == "fine" else "fine_declined",
+            {
+                "fine": "fine_issued",
+                "warning": "warning_issued",
+                "nofine": "fine_declined",
+                "closeok": "manual_answer_confirmed",
+            }[action],
             now=now,
             chat_id=wait.chat_id,
             username_lower=wait.username,
@@ -1708,27 +2068,32 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         )
 
         reference = source_reference(wait.source_message_link, wait.source_quote)
-        if action == "fine":
-            status_line = f"Штраф назначен: {settings.fine_amount_rubles} ₽"
-            if len(closed_waits) > 1:
-                status_line += " каждому адресату"
-        else:
-            status_line = "Штраф не назначен"
-        group_text = (
-            f"{status_line}.\n"
+        common = (
             f"Решение принял: {actor_label(callback.from_user)}\n"
-            f"Время решения: {format_event_dt(now, settings)}\n"
-            f"Адресаты: {wait_targets_label(closed_waits)}\n"
-            f"Исходное сообщение: {reference}"
+            f"Время решения: {format_event_dt(now, settings)}\n\n"
+            f"Адресаты: {wait_targets_label(closed_waits)}\n\n"
+            f"Что было:\n" + "\n".join(source_history_lines(closed_waits)) + "\n\n"
+            f"Исходное обращение:\n{reference}"
         )
+        if action == "fine":
+            header = (
+                "Обращение закрыто с нарушением регламента ответа.\n\n"
+                f"Руководитель зафиксировал штраф: {settings.fine_amount_rubles} ₽."
+            )
+        elif action == "warning":
+            header = (
+                "Обращение закрыто с нарушением регламента ответа.\n\n"
+                "Руководитель зафиксировал предупреждение."
+            )
+        elif action == "closeok":
+            header = "Обращение закрыто: руководитель подтвердил, что ответ был."
+        else:
+            header = "Обращение закрыто без штрафа."
+        group_text = f"{header}\n{common}"
         private_text = (
-            f"Решение сохранено.\n"
-            f"{status_line}.\n"
-            f"Я обновил третье уведомление в рабочей группе.\n"
-            f"Время решения: {format_event_dt(now, settings)}\n"
+            f"Решение сохранено.\n{header}\n\n"
             f"Адресаты: {wait_targets_label(closed_waits)}\n"
-            f"Исходное сообщение: {reference}\n"
-            f"Сумму и детализацию штрафов за месяц можно посмотреть командой /fines."
+            f"Исходное обращение: {reference}"
         )
         await edit_reminder_closed(bot, closed_waits[0], group_text)
         await edit_callback_message(callback, private_text)
@@ -1736,6 +2101,20 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         return
 
     if action in {"close", "confirmclose"}:
+        source_waits = await app_storage.active_waits_for_source_message(
+            chat_id=wait.chat_id,
+            source_message_id=wait.source_message_id,
+        )
+        source_waits = source_waits or [wait]
+        if not can_user_control_waits(source_waits, callback.from_user, settings):
+            await safe_callback_answer(
+                callback,
+                "Кнопка «Закрыть» доступна руководителю и адресатам обращения.",
+                show_alert=True,
+            )
+            return
+
+        await resolve_user_id_for_matching_waits(app_storage, source_waits, callback.from_user)
         closed_waits = await app_storage.close_waits_for_source_messages(
             chat_id=wait.chat_id,
             source_message_ids=[wait.source_message_id],
@@ -1750,6 +2129,14 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
                 username_lower=wait.username,
                 wait_id=wait.id,
                 value=len(closed_waits),
+            )
+            await app_storage.record_wait_events(
+                closed_waits,
+                event_type="manual_close" if action == "close" else "confirm_close",
+                created_at=now,
+                actor_user_id=callback.from_user.id,
+                actor_label=actor_label(callback.from_user),
+                text=None,
             )
             await safe_callback_answer(callback, "Ожидание закрыто.")
             await mark_waits_closed(
@@ -1773,44 +2160,119 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
             await safe_callback_answer(callback, "Ожидание уже закрыто.", show_alert=False)
         return
 
-    if action == "keep":
-        await app_storage.record_metric(
-            "wait_kept_by_confirm_button",
-            now=now,
-            chat_id=wait.chat_id,
-            username_lower=wait.username,
-            wait_id=wait.id,
+    if action in {"keep", "snooze"}:
+        await safe_callback_answer(
+            callback,
+            "Эта кнопка больше не используется. Нажмите «👀 Вижу» или «Закрыть».",
+            show_alert=True,
         )
-        await edit_callback_message(callback, f"Ок, продолжаю контроль: {wait_target_label(wait)}.")
-        await safe_callback_answer(callback, "Продолжаю контроль.")
-        return
-
-    if action == "snooze":
-        next_at = add_working_minutes(
-            now,
-            settings.reminder_interval_minutes,
-            settings.workday_start,
-            settings.workday_end,
-            settings.timezone,
-        )
-        snoozed_waits = await app_storage.reschedule_waits_for_source_messages(
-            chat_id=wait.chat_id,
-            source_message_ids=[wait.source_message_id],
-            next_reminder_at=next_at,
-        )
-        await app_storage.record_metric(
-            "wait_snoozed_by_button",
-            now=now,
-            chat_id=wait.chat_id,
-            username_lower=wait.username,
-            wait_id=wait.id,
-            value=max(len(snoozed_waits), 1),
-        )
-        await mark_waits_snoozed(bot, snoozed_waits or [wait], next_at, settings)
-        await safe_callback_answer(callback, "Отложено до следующего окна напоминания.")
         return
 
     await safe_callback_answer(callback, "Неизвестное действие.", show_alert=True)
+
+
+def reason_label(reason_key: str | None) -> str:
+    if not reason_key:
+        return "Причина задержки не указана"
+    return DELAY_REASONS.get(reason_key, reason_key)
+
+
+def source_history_lines(waits: list[PendingWait]) -> list[str]:
+    if not waits:
+        return ["— данных нет"]
+    reminder_count = max(wait.reminder_count for wait in waits)
+    lines = [f"— {reminder_count} {plural_ru(reminder_count, ('напоминание', 'напоминания', 'напоминаний'))} в чат"]
+    if any(wait.seen_at for wait in waits):
+        lines.append("— сотрудник нажимал «Вижу»")
+    if any(wait.last_intermediate_at for wait in waits):
+        lines.append("— были промежуточные ответы")
+    lines.append("— полноценного ответа нет")
+    return lines
+
+
+def employee_stats_text(stats: EmployeeStats) -> str:
+    avg = format_elapsed(datetime.now().astimezone() - timedelta(seconds=stats.avg_response_seconds_7d), datetime.now().astimezone()) if stats.avg_response_seconds_7d else "нет данных"
+    lines = [
+        f"— просрочек за 7 дней: {stats.overdue_7d}",
+        f"— штрафов за месяц: {stats.fines_month}",
+        f"— предупреждений за месяц: {stats.warnings_month}",
+        f"— среднее время ответа: {avg}",
+        f"— нажимал «Вижу»: {stats.seen_count_7d}",
+        f"— выбирал «Ответил, бот не увидел»: {stats.answered_not_seen_count_7d}",
+    ]
+    if stats.bot_missed_confirmed_month:
+        lines.append(f"— бот реально ошибся: {stats.bot_missed_confirmed_month}")
+    return "\n".join(lines)
+
+
+async def leader_request_text(
+    app_storage: Storage,
+    settings: Settings,
+    waits: list[PendingWait],
+    now: datetime,
+    *,
+    manual_review: bool = False,
+) -> str:
+    wait = waits[0]
+    chat_title = html.escape(wait.chat_title or str(wait.chat_id))
+    reference = source_reference(wait.source_message_link, wait.source_quote)
+    stats = await app_storage.employee_stats(username_lower=wait.username, user_id=wait.user_id, now=now)
+    intro = "Нужно решение по обращению."
+    if manual_review:
+        intro = (
+            "Сотрудник указал: «Ответил, бот не увидел».\n"
+            "Автоматически подтвердить ответ не удалось. Проверьте обращение вручную."
+        )
+    return (
+        f"{intro}\n\n"
+        f"Сотрудник: {wait_targets_label(waits)}\n"
+        f"Чат: {chat_title}\n"
+        f"Нет ответа: {format_elapsed(wait.created_at, now)}\n\n"
+        f"Что было:\n" + "\n".join(source_history_lines(waits)) + "\n\n"
+        f"История сотрудника:\n{employee_stats_text(stats)}\n\n"
+        f"Исходное обращение:\n{reference}"
+    )
+
+
+async def send_leader_decision_request(
+    bot: Bot,
+    app_storage: Storage,
+    settings: Settings,
+    waits: list[PendingWait],
+    now: datetime,
+    *,
+    manual_review: bool = False,
+) -> bool:
+    if not waits:
+        return False
+    wait = waits[0]
+    text = await leader_request_text(app_storage, settings, waits, now, manual_review=manual_review)
+    sent = await notify_leader(
+        bot,
+        app_storage,
+        settings,
+        text,
+        now,
+        wait,
+        reply_markup=leader_decision_keyboard(wait, settings.fine_amount_rubles, enable_warning=settings.enable_warning_decision),
+    )
+    if not sent:
+        return False
+
+    await app_storage.mark_leader_request_sent_for_source(
+        chat_id=wait.chat_id,
+        source_message_ids=[item.source_message_id for item in waits],
+        sent_at=now,
+    )
+    for item in waits:
+        await app_storage.record_metric(
+            "leader_decision_requested",
+            now=now,
+            chat_id=item.chat_id,
+            username_lower=item.username,
+            wait_id=item.id,
+        )
+    return True
 
 
 async def notify_leader(
@@ -1857,6 +2319,7 @@ async def send_group_reminder(
 
     source_waits = sorted(waits, key=lambda item: item.id)
     wait = source_waits[0]
+
     target_labels = wait_targets_label(source_waits)
     reminder_count = max(item.reminder_count for item in source_waits)
     dm_unreachable = any(is_direct_message_unreachable(item) for item in source_waits)
@@ -1878,44 +2341,33 @@ async def send_group_reminder(
 
     reference = source_reference(wait.source_message_link, wait.source_quote)
     next_reminder_number = reminder_count + 1
-    is_fine_warning = next_reminder_number == 2
-    is_fine_decision = next_reminder_number >= 3
+    should_request_leader = (
+        next_reminder_number >= settings.escalate_after_reminders
+        and not wait.leader_request_sent_at
+    )
     is_final_after_dm_failure = limit_applies and next_reminder_number >= dm_failure_limit
 
-    if is_fine_decision:
+    if should_request_leader:
         text = (
-            f"{target_labels}, третье напоминание по сообщению: {reference}\n"
-            f"Запрос на решение по штрафу отправлен руководителю {display_username(settings.leader_username)} в личку."
+            f"{target_labels}, ответа нет по сообщению: {reference}\n"
+            "Запрос на решение отправлен руководителю."
         )
-        reply_markup = source_link_keyboard(wait)
-    elif is_fine_warning:
+    elif next_reminder_number == 2:
         text = (
             f"{target_labels}, второе напоминание: нужен ответ по сообщению: {reference}\n"
-            f"Если ответа не будет в течение {settings.reminder_interval_minutes} минут, "
-            f"я отправлю руководителю запрос на штраф {settings.fine_amount_rubles} ₽."
+            f"Если ответа не будет до следующего напоминания, руководителю уйдёт запрос на решение. "
+            f"Возможен штраф {settings.fine_amount_rubles} ₽."
         )
-        reply_markup = wait_keyboard(wait)
     elif is_final_after_dm_failure:
         text = (
             f"{target_labels}, финальное напоминание по сообщению: {reference}\n"
             "Пожалуйста, не оставляйте обращения коллег без ответа: "
             "в рабочих чатах это недопустимо и задерживает работу команды."
         )
-        reply_markup = wait_keyboard(wait)
+    elif wait.seen_at:
+        text = f"{target_labels} видел обращение, но ответа пока нет: {reference}"
     else:
         text = f"{target_labels}, нужен ответ по сообщению: {reference}"
-        reply_markup = wait_keyboard(wait)
-
-    if not is_fine_decision and not is_final_after_dm_failure and reminder_count >= settings.escalate_after_reminders:
-        text += f"\n{display_username(settings.leader_username)}, подключитесь, пожалуйста."
-        for item in source_waits:
-            await app_storage.record_metric(
-                "leader_escalation_sent",
-                now=now,
-                chat_id=item.chat_id,
-                username_lower=item.username,
-                wait_id=item.id,
-            )
 
     await delete_previous_reminders(bot, source_waits)
 
@@ -1923,7 +2375,7 @@ async def send_group_reminder(
         chat_id=wait.chat_id,
         text=text,
         disable_web_page_preview=True,
-        reply_markup=reply_markup,
+        reply_markup=wait_keyboard(wait, settings),
         parse_mode="HTML",
         reply_parameters=ReplyParameters(
             message_id=wait.source_message_id,
@@ -1951,58 +2403,22 @@ async def send_group_reminder(
             username_lower=item.username,
             wait_id=item.id,
         )
-    if is_fine_decision:
-        chat_title = html.escape(wait.chat_title or str(wait.chat_id))
-        leader_request_text = (
-            f"Нужно решение по штрафу.\n"
-            f"Чат: {chat_title}\n"
-            f"Кто не отвечает: {target_labels}\n"
-            f"Сумма штрафа: {settings.fine_amount_rubles} ₽\n"
-            f"Исходное сообщение: {reference}"
-        )
-        leader_request_sent = await notify_leader(
-            bot,
-            app_storage,
-            settings,
-            leader_request_text,
-            now,
-            wait,
-            reply_markup=fine_decision_keyboard(wait, settings.fine_amount_rubles),
-        )
-        if not leader_request_sent:
-            try:
-                await bot.edit_message_text(
-                    chat_id=wait.chat_id,
-                    message_id=sent_message.message_id,
-                    text=(
-                        f"{target_labels}, третье напоминание по сообщению: {reference}\n"
-                        f"Не удалось отправить запрос на решение по штрафу руководителю в личку. "
-                        f"{display_username(settings.leader_username)}, проверьте, что вы нажали /start в личке с ботом."
-                    ),
-                    disable_web_page_preview=True,
-                    parse_mode="HTML",
-                    reply_markup=source_link_keyboard(wait),
-                )
-            except TelegramAPIError:
-                logger.exception("Cannot edit fine request failure message %s", sent_message.message_id)
-        for item in source_waits:
-            await app_storage.stop_group_reminders(item.id, now)
-            await app_storage.record_metric(
-                "fine_decision_requested",
-                now=now,
-                chat_id=item.chat_id,
-                username_lower=item.username,
-                wait_id=item.id,
-            )
-            if leader_request_sent:
+
+    if should_request_leader:
+        leader_notified = await send_leader_decision_request(bot, app_storage, settings, source_waits, now)
+        if leader_notified:
+            for item in source_waits:
+                await app_storage.stop_group_reminders(item.id, now)
                 await app_storage.record_metric(
-                    "fine_request_dm_sent",
+                    "group_reminders_stopped_after_leader_request",
                     now=now,
                     chat_id=item.chat_id,
                     username_lower=item.username,
                     wait_id=item.id,
                 )
-    elif is_final_after_dm_failure:
+        return
+
+    if is_final_after_dm_failure:
         for item in source_waits:
             await app_storage.stop_group_reminders(item.id, now)
             await app_storage.record_metric(
