@@ -2628,6 +2628,16 @@ async def send_daily_reports_if_due(bot: Bot, app_storage: Storage, settings: Se
             start_at=start_at,
             end_at=end_at,
         )
+        if not items:
+            await app_storage.mark_daily_report_sent(chat_id=chat_id, report_date=report_date, sent_at=now)
+            await app_storage.record_metric(
+                "daily_report_skipped_empty",
+                now=now,
+                chat_id=chat_id,
+                value=1,
+            )
+            continue
+
         try:
             await bot.send_message(
                 chat_id=chat_id,
