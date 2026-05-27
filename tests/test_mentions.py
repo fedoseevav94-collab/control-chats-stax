@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, single_source_waits, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -187,6 +187,20 @@ def test_select_waits_answered_by_message_keeps_ambiguous_many_waits_open() -> N
     assert select_waits_answered_by_message([first_wait, second_wait], message) == []
 
 
+def test_single_source_waits_returns_source_group_only_when_one_question_is_active() -> None:
+    first_wait = _wait(username="firstuser", display_name="@firstuser", user_id=None, source_message_id=10)
+    second_wait = _wait(username="seconduser", display_name="@seconduser", user_id=None, source_message_id=10)
+
+    assert single_source_waits([first_wait, second_wait]) == [first_wait, second_wait]
+
+
+def test_single_source_waits_keeps_multiple_questions_open() -> None:
+    first_wait = _wait(username="firstuser", display_name="@firstuser", user_id=None, source_message_id=10)
+    second_wait = _wait(username="firstuser", display_name="@firstuser", user_id=None, source_message_id=20)
+
+    assert single_source_waits([first_wait, second_wait]) == []
+
+
 def test_wait_matches_sender_display_for_hidden_username_employee() -> None:
     wait = _wait(username="user_id:456", display_name="Полина", user_id=None)
     user = User(id=456, is_bot=False, first_name="Полина")
@@ -213,6 +227,20 @@ def test_wait_matches_reaction_user_by_username() -> None:
     user = User(id=456, is_bot=False, first_name="Nor", username="Norblacksmith")
 
     assert wait_matches_telegram_user(wait, user)
+
+
+def test_wait_matches_username_when_only_trailing_digits_changed() -> None:
+    wait = _wait(username="lalalas19", display_name="@lalalas19", user_id=None)
+    user = User(id=456, is_bot=False, first_name="Rafael", username="Lalalas")
+
+    assert wait_matches_telegram_user(wait, user)
+
+
+def test_wait_does_not_match_short_username_stem_with_different_digits() -> None:
+    wait = _wait(username="alex1", display_name="@alex1", user_id=None)
+    user = User(id=456, is_bot=False, first_name="Alex", username="alex2")
+
+    assert not wait_matches_telegram_user(wait, user)
 
 
 def test_wait_does_not_match_reaction_from_other_hidden_user() -> None:

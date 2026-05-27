@@ -376,6 +376,22 @@ def wait_matches_sender_display(wait: PendingWait, user: User | None) -> bool:
     return wait_label in user_display_labels(user)
 
 
+def usernames_probably_same(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    left = left.removeprefix("@").lower()
+    right = right.removeprefix("@").lower()
+    if left == right:
+        return True
+
+    left_stem = re.sub(r"\d+$", "", left)
+    right_stem = re.sub(r"\d+$", "", right)
+    if left_stem != right_stem or len(left_stem) < 5:
+        return False
+
+    return left != left_stem or right != right_stem
+
+
 def wait_matches_telegram_user(wait: PendingWait, user: User | None) -> bool:
     if not user:
         return False
@@ -383,7 +399,7 @@ def wait_matches_telegram_user(wait: PendingWait, user: User | None) -> bool:
         return wait.user_id == user.id
 
     username = user.username.lower() if user.username else None
-    if username and wait.username == username:
+    if username and usernames_probably_same(wait.username, username):
         return True
 
     return wait_matches_sender_display(wait, user)
@@ -663,6 +679,13 @@ def group_waits_by_source(waits: list[PendingWait]) -> list[list[PendingWait]]:
     for wait in waits:
         groups.setdefault(wait.source_message_id, []).append(wait)
     return [sorted(group, key=lambda item: item.id) for group in groups.values()]
+
+
+def single_source_waits(waits: list[PendingWait]) -> list[PendingWait]:
+    source_groups = group_waits_by_source(waits)
+    if len(source_groups) == 1:
+        return source_groups[0]
+    return []
 
 
 def select_waits_answered_by_message(waits: list[PendingWait], message: Message) -> list[PendingWait]:
@@ -1746,6 +1769,27 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         return
 
     if sender_waits and actionable_mention_targets:
+        delegated_waits = single_source_waits(sender_waits)
+        if delegated_waits:
+            await close_waits_after_employee_message(
+                bot,
+                app_storage,
+                message,
+                delegated_waits,
+                now,
+                metric_name="wait_delegated_from_message",
+                reason="переадресовал вопрос",
+            )
+            await create_delegated_waits(
+                app_storage,
+                message,
+                settings,
+                actionable_mention_targets,
+                now,
+                source_waits_count=len(delegated_waits),
+            )
+            return
+
         for target in actionable_mention_targets:
             await create_wait_for_target(
                 app_storage,
@@ -1774,6 +1818,18 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
         return
 
     if sender_waits:
+        answered_waits = single_source_waits(sender_waits)
+        if answered_waits:
+            await record_employee_message_events(app_storage, answered_waits, message, event_type="full_answer", now=now)
+            await close_waits_after_employee_message(
+                bot,
+                app_storage,
+                message,
+                answered_waits,
+                now,
+                metric_name="wait_closed_by_single_active_message",
+                reason="ответил",
+            )
         return
 
     if not actionable_mention_targets:
@@ -2354,7 +2410,7 @@ async def send_group_reminder(
         )
     elif next_reminder_number == 2:
         text = (
-            f"{target_labels}, второе напоминание: нужен ответ по сообщению: {reference}\n"
+            f"{target_labels}, нужен ответ по сообщению: {reference}\n"
             f"Если ответа не будет до следующего напоминания, руководителю уйдёт запрос на решение. "
             f"Возможен штраф {settings.fine_amount_rubles} ₽."
         )
