@@ -400,7 +400,13 @@ def wait_matches_sender_display(wait: PendingWait, user: User | None) -> bool:
     wait_label = normalized_match_text(wait.display_name)
     if not wait_label or wait_label.startswith("@"):
         return False
-    return wait_label in user_display_labels(user)
+
+    for label in user_display_labels(user):
+        if wait_label == label:
+            return True
+        if len(label) >= 5 and text_contains_standalone_name(wait.display_name, label):
+            return True
+    return False
 
 
 def usernames_probably_same(left: str | None, right: str | None) -> bool:
@@ -1751,9 +1757,13 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     # text_mention, or tg://user links. Plain names in normal text are used only
     # to match already active waits, not to create new control tasks.
     explicit_targets = extract_mention_targets(message)
+    target_candidates = explicit_targets
+    if message.photo or message.document or message.video:
+        target_candidates = await extend_targets_from_known_names(app_storage, message, explicit_targets)
+
     mention_targets = [
         target
-        for target in explicit_targets
+        for target in target_candidates
         if not (
             (sender_id is not None and target.user_id == sender_id)
             or (sender_username is not None and target.identity == sender_username)

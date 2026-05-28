@@ -260,6 +260,13 @@ def test_wait_matches_sender_display_for_hidden_username_employee() -> None:
     assert wait_matches_sender_display(wait, user)
 
 
+def test_wait_matches_sender_display_with_work_suffix() -> None:
+    wait = _wait(username="user_id:456", display_name="Дмитрий Глумов STAX", user_id=None)
+    user = User(id=456, is_bot=False, first_name="Дмитрий", last_name="Глумов")
+
+    assert wait_matches_sender_display(wait, user)
+
+
 def test_wait_does_not_match_other_user_id_by_display_name() -> None:
     wait = _wait(username="user_id:456", display_name="Полина", user_id=456)
     user = User(id=789, is_bot=False, first_name="Полина")
