@@ -239,6 +239,9 @@ def message_requires_response(message: Message, targets: list[MentionTarget]) ->
     if always_requires_response:
         return True
 
+    if message.photo or message.document or message.video:
+        return True
+
     if any(phrase in normalized for phrase in RESPONSE_REQUEST_PHRASES):
         return True
 
@@ -1543,6 +1546,7 @@ async def close_waits_after_employee_message(
     message: Message,
     waits: list[PendingWait],
     now: datetime,
+    settings: Settings,
     *,
     metric_name: str,
     reason: str,
@@ -1773,6 +1777,7 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
             message,
             reply_source_waits,
             now,
+            settings,
             metric_name="wait_delegated_from_reply",
             reason="переадресовал вопрос",
         )
@@ -1795,6 +1800,7 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
                 message,
                 delegated_waits,
                 now,
+                settings,
                 metric_name="wait_delegated_from_message",
                 reason="переадресовал вопрос",
             )
@@ -1830,6 +1836,7 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
             message,
             reply_source_waits,
             now,
+            settings,
             metric_name="wait_closed_by_reply",
             reason="ответил reply-ом",
         )
@@ -1845,6 +1852,7 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
                 message,
                 answered_waits,
                 now,
+                settings,
                 metric_name="wait_closed_by_single_active_message",
                 reason="ответил",
             )
@@ -2255,7 +2263,7 @@ def source_history_lines(waits: list[PendingWait]) -> list[str]:
     if not waits:
         return ["— данных нет"]
     reminder_count = max(wait.reminder_count for wait in waits)
-    lines = [f"— {reminder_count} {plural_ru(reminder_count, ('напоминание', 'напоминания', 'напоминаний'))} в чат"]
+    lines = [f"— {plural_ru(reminder_count, ('напоминание', 'напоминания', 'напоминаний'))} в чат"]
     if any(wait.seen_at for wait in waits):
         lines.append("— сотрудник нажимал «Вижу»")
     if any(wait.last_intermediate_at for wait in waits):

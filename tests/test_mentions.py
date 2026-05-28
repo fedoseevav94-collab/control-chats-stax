@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, single_source_waits, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -116,6 +116,26 @@ def test_mention_only_to_k_kram1_does_not_start_control() -> None:
     targets = [SimpleNamespace(identity="k_kram1", display_name="@k_kram1", username="k_kram1")]
 
     assert not message_requires_response(message, targets)
+
+
+def test_document_with_addressed_caption_starts_control() -> None:
+    message = SimpleNamespace(
+        text=None,
+        caption="+79160896627 Полина",
+        photo=None,
+        document=object(),
+        video=None,
+    )
+    targets = [SimpleNamespace(identity="user_id:456", display_name="Полина", username=None)]
+
+    assert message_requires_response(message, targets)
+
+
+def test_source_history_lines_do_not_duplicate_reminder_count() -> None:
+    wait = _wait(username="sp", display_name="SP ⚡", user_id=None)
+    wait = wait.__class__(**{**wait.__dict__, "reminder_count": 2})
+
+    assert source_history_lines([wait])[0] == "— 2 напоминания в чат"
 
 
 def test_wait_target_label_uses_clickable_user_id_when_username_is_hidden() -> None:
