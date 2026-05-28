@@ -77,6 +77,14 @@ def actor_label(user: User | None) -> str:
     return html.escape(full_name or f"user_id:{user.id}")
 
 
+def bot_update_label(settings: Settings) -> str:
+    date_part = settings.bot_update_date.strip()
+    time_part = settings.bot_update_time.strip()
+    if time_part:
+        return f"{date_part} {time_part} МСК"
+    return date_part
+
+
 def commands_help_text(settings: Settings, user: User | None) -> str:
     lines = [
         "Доступные команды:",
@@ -111,7 +119,7 @@ def commands_help_text(settings: Settings, user: User | None) -> str:
             ]
         )
 
-    lines.extend(["", f"Обновлено: {settings.bot_update_date}"])
+    lines.extend(["", f"Обновлено: {bot_update_label(settings)}"])
 
     return "\n".join(lines)
 
@@ -1421,7 +1429,7 @@ async def settings_command(message: Message, app_storage: Storage, settings: Set
                 f"Руководитель: {display_username(settings.leader_username)}",
                 f"Штраф: {settings.fine_amount_rubles} ₽",
                 f"Отсрочка по кнопке «Вижу»: {settings.seen_delay_minutes} мин.",
-                f"Дата обновления: {settings.bot_update_date}",
+                f"Дата обновления: {bot_update_label(settings)}",
                 "Закрытие ответом: только reply на исходное обращение или напоминание бота",
                 "Кнопки в напоминании: 👀 Вижу и Закрыть",
                 f"Предупреждения: {'включено' if settings.enable_warning_decision else 'выключено'}",
