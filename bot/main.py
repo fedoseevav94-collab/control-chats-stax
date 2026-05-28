@@ -219,10 +219,15 @@ def message_requires_response(message: Message, targets: list[MentionTarget]) ->
     if not mentions_only:
         return False
 
+    always_requires_response = any(target.identity == "k_kram1" for target in targets)
+
     if any(phrase in normalized for phrase in NON_REQUEST_PHRASES) and not any(
         phrase in normalized for phrase in RESPONSE_REQUEST_PHRASES
-    ):
+    ) and not always_requires_response:
         return False
+
+    if always_requires_response:
+        return True
 
     if any(phrase in normalized for phrase in RESPONSE_REQUEST_PHRASES):
         return True
@@ -2405,27 +2410,28 @@ async def send_group_reminder(
     )
     is_final_after_dm_failure = limit_applies and next_reminder_number >= dm_failure_limit
 
+    reminder_prefix = f"Напоминание {next_reminder_number}."
     if should_request_leader:
         text = (
-            f"{target_labels}, ответа нет по сообщению: {reference}\n"
+            f"{reminder_prefix} {target_labels}, ответа нет по сообщению: {reference}\n"
             "Запрос на решение отправлен руководителю."
         )
     elif next_reminder_number == 2:
         text = (
-            f"{target_labels}, нужен ответ по сообщению: {reference}\n"
+            f"{reminder_prefix} {target_labels}, нужен ответ по сообщению: {reference}\n"
             f"Если ответа не будет до следующего напоминания, руководителю уйдёт запрос на решение. "
             f"Возможен штраф {settings.fine_amount_rubles} ₽."
         )
     elif is_final_after_dm_failure:
         text = (
-            f"{target_labels}, финальное напоминание по сообщению: {reference}\n"
+            f"{reminder_prefix} {target_labels}, финальное напоминание по сообщению: {reference}\n"
             "Пожалуйста, не оставляйте обращения коллег без ответа: "
             "в рабочих чатах это недопустимо и задерживает работу команды."
         )
     elif wait.seen_at:
-        text = f"{target_labels} видел обращение, но ответа пока нет: {reference}"
+        text = f"{reminder_prefix} {target_labels} видел обращение, но ответа пока нет: {reference}"
     else:
-        text = f"{target_labels}, нужен ответ по сообщению: {reference}"
+        text = f"{reminder_prefix} {target_labels}, нужен ответ по сообщению: {reference}"
 
     await delete_previous_reminders(bot, source_waits)
 

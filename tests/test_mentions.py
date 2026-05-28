@@ -102,6 +102,22 @@ def test_dispatch_complaint_phrase_with_mention_starts_control() -> None:
     assert message_requires_response(message, targets)
 
 
+def test_any_substantive_message_to_k_kram1_starts_control() -> None:
+    text = "Передали документы @k_kram1"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="k_kram1", display_name="@k_kram1", username="k_kram1")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_mention_only_to_k_kram1_does_not_start_control() -> None:
+    text = "@k_kram1"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="k_kram1", display_name="@k_kram1", username="k_kram1")]
+
+    assert not message_requires_response(message, targets)
+
+
 def test_wait_target_label_uses_clickable_user_id_when_username_is_hidden() -> None:
     wait = _wait(username="user_id:456", display_name="Hidden User", user_id=456)
 
