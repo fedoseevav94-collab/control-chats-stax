@@ -86,6 +86,22 @@ def test_message_with_mention_without_request_does_not_start_control() -> None:
     assert not message_requires_response(message, targets)
 
 
+def test_dispatch_shortage_phrase_with_mention_starts_control() -> None:
+    text = "Gavr - нет д/с @k_kram1"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="k_kram1", display_name="@k_kram1", username="k_kram1")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_dispatch_complaint_phrase_with_mention_starts_control() -> None:
+    text = "Вт ругаются @k_kram1"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="k_kram1", display_name="@k_kram1", username="k_kram1")]
+
+    assert message_requires_response(message, targets)
+
+
 def test_wait_target_label_uses_clickable_user_id_when_username_is_hidden() -> None:
     wait = _wait(username="user_id:456", display_name="Hidden User", user_id=456)
 
