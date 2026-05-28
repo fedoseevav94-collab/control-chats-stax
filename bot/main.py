@@ -111,6 +111,8 @@ def commands_help_text(settings: Settings, user: User | None) -> str:
             ]
         )
 
+    lines.extend(["", f"Обновлено: {settings.bot_update_date}"])
+
     return "\n".join(lines)
 
 
@@ -1419,6 +1421,7 @@ async def settings_command(message: Message, app_storage: Storage, settings: Set
                 f"Руководитель: {display_username(settings.leader_username)}",
                 f"Штраф: {settings.fine_amount_rubles} ₽",
                 f"Отсрочка по кнопке «Вижу»: {settings.seen_delay_minutes} мин.",
+                f"Дата обновления: {settings.bot_update_date}",
                 "Закрытие ответом: только reply на исходное обращение или напоминание бота",
                 "Кнопки в напоминании: 👀 Вижу и Закрыть",
                 f"Предупреждения: {'включено' if settings.enable_warning_decision else 'выключено'}",

@@ -36,6 +36,7 @@ class Settings:
     enable_seen_button: bool
     enable_smart_reply_detection: bool
     enable_warning_decision: bool
+    bot_update_date: str
     database_path: Path
     scheduler_tick_seconds: int = 30
     scheduler_startup_grace_seconds: int = 45
@@ -72,6 +73,7 @@ def load_settings() -> Settings:
         enable_seen_button=env.bool("ENABLE_SEEN_BUTTON", True),
         enable_smart_reply_detection=env.bool("ENABLE_SMART_REPLY_DETECTION", True),
         enable_warning_decision=env.bool("ENABLE_WARNING_DECISION", True),
+        bot_update_date=env.str("BOT_UPDATE_DATE", "28.05.2026"),
         database_path=Path(env.str("DATABASE_PATH", "bot.sqlite3")),
         scheduler_tick_seconds=env.int("SCHEDULER_TICK_SECONDS", 30),
         scheduler_startup_grace_seconds=env.int("SCHEDULER_STARTUP_GRACE_SECONDS", 45),
