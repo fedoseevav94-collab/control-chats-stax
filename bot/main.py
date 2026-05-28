@@ -137,6 +137,13 @@ async def setup_bot_commands(bot: Bot) -> None:
     )
 
 
+def detach_router_from_dispatcher() -> None:
+    # Aiogram keeps the parent dispatcher on the router. The local restart wrapper
+    # calls main() again in the same process, so the module-level router must be detached first.
+    if router.parent_router is not None:
+        router._parent_router = None
+
+
 def wait_target_label(wait: PendingWait) -> str:
     if wait.user_id and wait.display_name and wait.display_name != display_username(wait.username):
         name = html.escape(wait.display_name)
@@ -2762,6 +2769,7 @@ async def main() -> None:
     bot = Bot(settings.bot_token)
     await setup_bot_commands(bot)
     dispatcher = Dispatcher(app_storage=storage, settings=settings)
+    detach_router_from_dispatcher()
     dispatcher.include_router(router)
 
     scheduler_task = asyncio.create_task(scheduler_loop(bot, storage, settings))
@@ -2770,6 +2778,7 @@ async def main() -> None:
         await dispatcher.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
     finally:
         scheduler_task.cancel()
+        detach_router_from_dispatcher()
         await bot.session.close()
         await storage.close()
 
