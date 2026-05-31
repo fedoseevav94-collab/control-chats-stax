@@ -41,6 +41,8 @@ class PendingWait:
     delay_reason: str | None
     delay_reason_at: datetime | None
     leader_request_sent_at: datetime | None
+    leader_request_chat_id: int | None
+    leader_request_message_id: int | None
     status: str
 
 
@@ -177,6 +179,8 @@ class Storage:
                 delay_reason TEXT,
                 delay_reason_at TEXT,
                 leader_request_sent_at TEXT,
+                leader_request_chat_id INTEGER,
+                leader_request_message_id INTEGER,
                 status TEXT NOT NULL DEFAULT 'active',
                 closed_at TEXT,
                 closed_by_user_id INTEGER
@@ -263,6 +267,8 @@ class Storage:
         await self._add_column_if_missing("waits", "group_reminders_stopped_at", "TEXT")
         await self._add_column_if_missing("waits", "display_name", "TEXT")
         await self._add_column_if_missing("waits", "leader_request_sent_at", "TEXT")
+        await self._add_column_if_missing("waits", "leader_request_chat_id", "INTEGER")
+        await self._add_column_if_missing("waits", "leader_request_message_id", "INTEGER")
         await self._add_column_if_missing("waits", "delay_reason_at", "TEXT")
         await self._add_column_if_missing("waits", "delay_reason", "TEXT")
         await self._add_column_if_missing("waits", "reason_due_at", "TEXT")
@@ -954,6 +960,8 @@ class Storage:
         chat_id: int,
         source_message_ids: list[int],
         sent_at: datetime,
+        leader_chat_id: int,
+        leader_message_id: int,
     ) -> list[PendingWait]:
         waits = await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
         if not waits:
@@ -965,11 +973,13 @@ class Storage:
             f"""
             UPDATE waits
             SET leader_request_sent_at = ?,
+                leader_request_chat_id = ?,
+                leader_request_message_id = ?,
                 group_reminders_stopped_at = ?,
                 updated_at = ?
             WHERE id IN ({placeholders}) AND status = 'active'
             """,
-            (dt_to_db(sent_at), dt_to_db(sent_at), dt_to_db(sent_at), *wait_ids),
+            (dt_to_db(sent_at), leader_chat_id, leader_message_id, dt_to_db(sent_at), dt_to_db(sent_at), *wait_ids),
         )
         await self.conn.commit()
         return await self.active_waits_for_source_messages(chat_id=chat_id, source_message_ids=source_message_ids)
@@ -1368,6 +1378,8 @@ class Storage:
                 if row["leader_request_sent_at"]
                 else None
             ),
+            leader_request_chat_id=row["leader_request_chat_id"],
+            leader_request_message_id=row["leader_request_message_id"],
             status=row["status"],
         )
 

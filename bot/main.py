@@ -199,14 +199,78 @@ def source_link_keyboard(wait: PendingWait) -> InlineKeyboardMarkup | None:
     )
 
 
-def leader_decision_keyboard(wait: PendingWait, fine_amount: int, *, enable_warning: bool = True) -> InlineKeyboardMarkup:
+def wait_target_button_label(wait: PendingWait, limit: int = 42) -> str:
+    label = wait.display_name or (display_username(wait.username) if not wait.username.startswith("user_id:") else wait.username)
+    label = re.sub(r"\s+", " ", label).strip()
+    if len(label) <= limit:
+        return label
+    return label[: limit - 1].rstrip() + "…"
+
+
+def encode_selected_wait_mask(waits: list[PendingWait], selected_wait_ids: set[int]) -> str:
+    mask = 0
+    for index, wait in enumerate(waits):
+        if wait.id in selected_wait_ids:
+            mask |= 1 << index
+    return format(mask, "x")
+
+
+def decode_selected_wait_mask(waits: list[PendingWait], value: str | None) -> set[int]:
+    if not value:
+        return set()
+    try:
+        mask = int(value, 16)
+    except ValueError:
+        return set()
+    return {wait.id for index, wait in enumerate(waits) if mask & (1 << index)}
+
+
+def leader_decision_keyboard(waits: list[PendingWait], fine_amount: int, *, enable_warning: bool = True) -> InlineKeyboardMarkup:
+    wait = waits[0]
     buttons = [[InlineKeyboardButton(text="✅ Закрыть без штрафа", callback_data=f"wait:closeok:{wait.id}")]]
     if enable_warning:
         buttons.append([InlineKeyboardButton(text="⚠️ Предупреждение", callback_data=f"wait:warning:{wait.id}")])
-    buttons.append([InlineKeyboardButton(text=f"💰 Назначить штраф {fine_amount} ₽", callback_data=f"wait:fine:{wait.id}")])
+    if len(waits) > 1:
+        buttons.append([InlineKeyboardButton(text=f"💰 Выбрать штрафы {fine_amount} ₽", callback_data=f"wait:fineselect:{wait.id}")])
+    else:
+        buttons.append([InlineKeyboardButton(text=f"💰 Назначить штраф {fine_amount} ₽", callback_data=f"wait:fine:{wait.id}")])
     buttons.append([InlineKeyboardButton(text="🚫 Не штрафовать", callback_data=f"wait:nofine:{wait.id}")])
     if wait.source_message_link:
         buttons.append([InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def fine_selection_keyboard(
+    waits: list[PendingWait],
+    fine_amount: int,
+    *,
+    selected_wait_ids: set[int] | None = None,
+) -> InlineKeyboardMarkup:
+    selected_wait_ids = selected_wait_ids or set()
+    base_wait = waits[0]
+    valid_ids = {wait.id for wait in waits}
+    selected_wait_ids &= valid_ids
+    selected_encoded = encode_selected_wait_mask(waits, selected_wait_ids)
+    buttons: list[list[InlineKeyboardButton]] = []
+    for wait in waits:
+        marker = "✅" if wait.id in selected_wait_ids else "⬜"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{marker} {wait_target_button_label(wait)}",
+                    callback_data=f"wait:finetoggle:{base_wait.id}:{wait.id}:{selected_encoded}",
+                )
+            ]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text=f"💰 Подтвердить штраф {fine_amount} ₽",
+                callback_data=f"wait:fineconfirm:{base_wait.id}:{selected_encoded}",
+            )
+        ]
+    )
+    buttons.append([InlineKeyboardButton(text="↩️ Назад", callback_data=f"wait:finecancel:{base_wait.id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -1105,6 +1169,63 @@ async def edit_reminder_closed(bot: Bot, wait: PendingWait, text: str) -> None:
         logger.exception("Cannot mark reminder %s as closed", wait.last_reminder_message_id)
 
 
+async def edit_leader_request_closed(
+    bot: Bot,
+    waits: list[PendingWait],
+    closed_by: str,
+    reason: str,
+    action_at: datetime,
+    settings: Settings,
+    *,
+    time_label: str = "Время реакции",
+) -> None:
+    edited_messages: set[tuple[int, int]] = set()
+    for wait in waits:
+        if not wait.leader_request_chat_id or not wait.leader_request_message_id:
+            continue
+        key = (wait.leader_request_chat_id, wait.leader_request_message_id)
+        if key in edited_messages:
+            continue
+        edited_messages.add(key)
+        same_request_waits = [
+            item
+            for item in waits
+            if item.leader_request_chat_id == wait.leader_request_chat_id
+            and item.leader_request_message_id == wait.leader_request_message_id
+        ] or [wait]
+        source_created_at = min(item.created_at for item in same_request_waits)
+        reference = source_reference(wait.source_message_link, wait.source_quote)
+        text = (
+            "Закрыто в рабочем чате.\n"
+            f"Кто закрыл: {closed_by} {reason}.\n"
+            f"{time_label}: {format_event_dt(action_at, settings)}\n"
+            f"Прошло с обращения: {format_elapsed(source_created_at, action_at)}\n"
+            f"Адресаты: {wait_targets_label(same_request_waits)}\n"
+            f"Исходное обращение: {reference}"
+        )
+        try:
+            await bot.edit_message_text(
+                chat_id=wait.leader_request_chat_id,
+                message_id=wait.leader_request_message_id,
+                text=text,
+                disable_web_page_preview=True,
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        except TelegramBadRequest as error:
+            logger.warning("Cannot edit leader request %s: %s", wait.leader_request_message_id, error)
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=wait.leader_request_chat_id,
+                    message_id=wait.leader_request_message_id,
+                    reply_markup=None,
+                )
+            except TelegramAPIError:
+                logger.exception("Cannot remove keyboard from leader request %s", wait.leader_request_message_id)
+        except TelegramAPIError:
+            logger.exception("Cannot mark leader request %s as closed", wait.leader_request_message_id)
+
+
 async def mark_waits_closed(
     bot: Bot,
     waits: list[PendingWait],
@@ -1135,6 +1256,16 @@ async def mark_waits_closed(
             f"Исходное сообщение: {reference}"
         )
         await edit_reminder_closed(bot, wait, text)
+
+    await edit_leader_request_closed(
+        bot,
+        waits,
+        closed_by,
+        reason,
+        action_at,
+        settings,
+        time_label=time_label,
+    )
 
 
 async def mark_wait_already_closed(bot: Bot, wait: PendingWait) -> None:
@@ -1962,13 +2093,196 @@ async def handle_message_reaction(
     await mark_waits_closed(bot, closed_waits, actor_label(event.user), "поставил реакцию", event.date, settings)
 
 
+async def apply_leader_decision(
+    callback: CallbackQuery,
+    bot: Bot,
+    app_storage: Storage,
+    settings: Settings,
+    wait: PendingWait,
+    now: datetime,
+    action: str,
+    *,
+    fine_wait_ids: set[int] | None = None,
+) -> None:
+    if not is_leader(callback.from_user, settings):
+        await safe_callback_answer(
+            callback,
+            f"Решение может принять только {display_username(settings.leader_username)}.",
+            show_alert=True,
+        )
+        return
+
+    closed_waits = await app_storage.close_waits_for_source_messages(
+        chat_id=wait.chat_id,
+        source_message_ids=[wait.source_message_id],
+        closed_by_user_id=callback.from_user.id,
+        now=now,
+    )
+    if not closed_waits:
+        await safe_callback_answer(callback, "Ожидание уже закрыто.", show_alert=False)
+        return
+
+    decision_map = {
+        "fine": "issued",
+        "warning": "warning",
+        "nofine": "declined",
+        "closeok": "manual_answer_confirmed",
+    }
+    decision = decision_map[action]
+    fined_waits: list[PendingWait] = []
+    non_fined_waits: list[PendingWait] = []
+    if action == "fine":
+        if fine_wait_ids is None:
+            fined_waits = closed_waits
+        else:
+            fined_waits = [item for item in closed_waits if item.id in fine_wait_ids]
+            non_fined_waits = [item for item in closed_waits if item.id not in fine_wait_ids]
+        if not fined_waits:
+            await safe_callback_answer(callback, "Выберите хотя бы одного сотрудника для штрафа.", show_alert=True)
+            return
+        await app_storage.record_fine_decisions(
+            waits=fined_waits,
+            decision="issued",
+            amount_rubles=settings.fine_amount_rubles,
+            decided_by_user_id=callback.from_user.id,
+            decided_at=now,
+        )
+        if non_fined_waits:
+            await app_storage.record_fine_decisions(
+                waits=non_fined_waits,
+                decision="declined",
+                amount_rubles=0,
+                decided_by_user_id=callback.from_user.id,
+                decided_at=now,
+            )
+    else:
+        await app_storage.record_fine_decisions(
+            waits=closed_waits,
+            decision=decision,
+            amount_rubles=0,
+            decided_by_user_id=callback.from_user.id,
+            decided_at=now,
+        )
+
+    if action == "fine":
+        await app_storage.record_wait_events(
+            fined_waits,
+            event_type="leader_decision_issued",
+            created_at=now,
+            actor_user_id=callback.from_user.id,
+            actor_label=actor_label(callback.from_user),
+            text=reason_label(wait.delay_reason),
+        )
+        if non_fined_waits:
+            await app_storage.record_wait_events(
+                non_fined_waits,
+                event_type="leader_decision_declined",
+                created_at=now,
+                actor_user_id=callback.from_user.id,
+                actor_label=actor_label(callback.from_user),
+                text=reason_label(wait.delay_reason),
+            )
+    else:
+        await app_storage.record_wait_events(
+            closed_waits,
+            event_type=f"leader_decision_{decision}",
+            created_at=now,
+            actor_user_id=callback.from_user.id,
+            actor_label=actor_label(callback.from_user),
+            text=reason_label(wait.delay_reason),
+        )
+
+    metric_by_action = {
+        "fine": "fine_issued",
+        "warning": "warning_issued",
+        "nofine": "fine_declined",
+        "closeok": "manual_answer_confirmed",
+    }
+    await app_storage.record_metric(
+        metric_by_action[action],
+        now=now,
+        chat_id=wait.chat_id,
+        username_lower=wait.username,
+        wait_id=wait.id,
+        value=len(fined_waits) if action == "fine" else len(closed_waits),
+    )
+    if action == "fine" and non_fined_waits:
+        await app_storage.record_metric(
+            "fine_declined",
+            now=now,
+            chat_id=wait.chat_id,
+            username_lower=wait.username,
+            wait_id=wait.id,
+            value=len(non_fined_waits),
+        )
+
+    reference = source_reference(wait.source_message_link, wait.source_quote)
+    public_reference = (
+        source_reference(wait.source_message_link, "открыть исходное обращение")
+        if wait.source_message_link
+        else reference
+    )
+    common_tail = (
+        f"Решение принял: {actor_label(callback.from_user)}\n"
+        f"Время решения: {format_event_dt(now, settings)}\n\n"
+        f"Что было:\n" + "\n".join(source_history_lines(closed_waits)) + "\n\n"
+        f"Исходное обращение:\n{public_reference}"
+    )
+    if action == "fine":
+        fined_labels = wait_targets_label(fined_waits)
+        header = (
+            "Обращение закрыто с нарушением регламента ответа.\n\n"
+            f"Руководитель зафиксировал штраф: {settings.fine_amount_rubles} ₽."
+        )
+        group_text = f"{header}\n{common_tail}\n\nКому назначен штраф: {fined_labels}"
+        private_text = (
+            f"Решение сохранено.\n{header}\n\n"
+            f"Кому назначен штраф: {fined_labels}\n"
+            f"Исходное обращение: {reference}"
+        )
+    else:
+        common = (
+            f"Решение принял: {actor_label(callback.from_user)}\n"
+            f"Время решения: {format_event_dt(now, settings)}\n\n"
+            f"Адресаты: {wait_targets_label(closed_waits)}\n\n"
+            f"Что было:\n" + "\n".join(source_history_lines(closed_waits)) + "\n\n"
+            f"Исходное обращение:\n{reference}"
+        )
+        if action == "warning":
+            header = (
+                "Обращение закрыто с нарушением регламента ответа.\n\n"
+                "Руководитель зафиксировал предупреждение."
+            )
+        elif action == "closeok":
+            header = "Обращение закрыто: руководитель подтвердил, что ответ был."
+        else:
+            header = "Обращение закрыто без штрафа."
+        group_text = f"{header}\n{common}"
+        private_text = (
+            f"Решение сохранено.\n{header}\n\n"
+            f"Адресаты: {wait_targets_label(closed_waits)}\n"
+            f"Исходное обращение: {reference}"
+        )
+
+    await edit_reminder_closed(bot, closed_waits[0], group_text)
+    await edit_callback_message(callback, private_text)
+    await safe_callback_answer(callback, "Решение сохранено, сообщение в группе обновлено.")
+
+
 @router.callback_query(F.data.startswith("wait:"))
 async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage, settings: Settings) -> None:
     if not callback.data:
         return
 
-    _, action, wait_id_raw = callback.data.split(":", maxsplit=2)
+    callback_parts = callback.data.split(":")
+    if len(callback_parts) < 3:
+        await safe_callback_answer(callback, "Неизвестное действие.", show_alert=True)
+        return
+    _, action, wait_id_raw, *callback_args = callback_parts
     logger.info("Callback %s for wait %s from user %s", action, wait_id_raw, callback.from_user.id)
+    if not wait_id_raw.isdigit():
+        await safe_callback_answer(callback, "Неизвестное ожидание.", show_alert=True)
+        return
     wait = await app_storage.get_wait_by_id(int(wait_id_raw))
     if not wait or wait.status != "active":
         await safe_callback_answer(callback, "Это ожидание уже закрыто.", show_alert=False)
@@ -2110,7 +2424,7 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         await safe_callback_answer(callback, "Причина сохранена.")
         return
 
-    if action in {"fine", "nofine", "warning", "closeok"}:
+    if action in {"fineselect", "finetoggle", "finecancel", "fineconfirm"}:
         if not is_leader(callback.from_user, settings):
             await safe_callback_answer(
                 callback,
@@ -2118,85 +2432,76 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
                 show_alert=True,
             )
             return
-
-        closed_waits = await app_storage.close_waits_for_source_messages(
+        source_waits = await app_storage.active_waits_for_source_message(
             chat_id=wait.chat_id,
-            source_message_ids=[wait.source_message_id],
-            closed_by_user_id=callback.from_user.id,
-            now=now,
+            source_message_id=wait.source_message_id,
         )
-        if not closed_waits:
+        if not source_waits:
             await safe_callback_answer(callback, "Ожидание уже закрыто.", show_alert=False)
             return
 
-        decision_map = {
-            "fine": "issued",
-            "warning": "warning",
-            "nofine": "declined",
-            "closeok": "manual_answer_confirmed",
-        }
-        decision = decision_map[action]
-        amount = settings.fine_amount_rubles if action == "fine" else 0
-        await app_storage.record_fine_decisions(
-            waits=closed_waits,
-            decision=decision,
-            amount_rubles=amount,
-            decided_by_user_id=callback.from_user.id,
-            decided_at=now,
-        )
-        await app_storage.record_wait_events(
-            closed_waits,
-            event_type=f"leader_decision_{decision}",
-            created_at=now,
-            actor_user_id=callback.from_user.id,
-            actor_label=actor_label(callback.from_user),
-            text=reason_label(wait.delay_reason),
-        )
-        await app_storage.record_metric(
-            {
-                "fine": "fine_issued",
-                "warning": "warning_issued",
-                "nofine": "fine_declined",
-                "closeok": "manual_answer_confirmed",
-            }[action],
-            now=now,
-            chat_id=wait.chat_id,
-            username_lower=wait.username,
-            wait_id=wait.id,
-            value=len(closed_waits),
-        )
+        if action == "finecancel":
+            if callback.message:
+                await bot.edit_message_reply_markup(
+                    chat_id=callback.message.chat.id,
+                    message_id=callback.message.message_id,
+                    reply_markup=leader_decision_keyboard(
+                        source_waits,
+                        settings.fine_amount_rubles,
+                        enable_warning=settings.enable_warning_decision,
+                    ),
+                )
+            await safe_callback_answer(callback, "Вернул общий выбор.")
+            return
 
-        reference = source_reference(wait.source_message_link, wait.source_quote)
-        common = (
-            f"Решение принял: {actor_label(callback.from_user)}\n"
-            f"Время решения: {format_event_dt(now, settings)}\n\n"
-            f"Адресаты: {wait_targets_label(closed_waits)}\n\n"
-            f"Что было:\n" + "\n".join(source_history_lines(closed_waits)) + "\n\n"
-            f"Исходное обращение:\n{reference}"
-        )
-        if action == "fine":
-            header = (
-                "Обращение закрыто с нарушением регламента ответа.\n\n"
-                f"Руководитель зафиксировал штраф: {settings.fine_amount_rubles} ₽."
-            )
-        elif action == "warning":
-            header = (
-                "Обращение закрыто с нарушением регламента ответа.\n\n"
-                "Руководитель зафиксировал предупреждение."
-            )
-        elif action == "closeok":
-            header = "Обращение закрыто: руководитель подтвердил, что ответ был."
+        if action == "fineselect":
+            selected_ids: set[int] = set()
+        elif action == "finetoggle":
+            if not callback_args:
+                await safe_callback_answer(callback, "Не понял выбор сотрудника.", show_alert=True)
+                return
+            toggle_id = int(callback_args[0]) if callback_args[0].isdigit() else 0
+            selected_ids = decode_selected_wait_mask(source_waits, callback_args[1] if len(callback_args) > 1 else "")
+            valid_ids = {item.id for item in source_waits}
+            selected_ids &= valid_ids
+            if toggle_id in selected_ids:
+                selected_ids.remove(toggle_id)
+            elif toggle_id in valid_ids:
+                selected_ids.add(toggle_id)
         else:
-            header = "Обращение закрыто без штрафа."
-        group_text = f"{header}\n{common}"
-        private_text = (
-            f"Решение сохранено.\n{header}\n\n"
-            f"Адресаты: {wait_targets_label(closed_waits)}\n"
-            f"Исходное обращение: {reference}"
-        )
-        await edit_reminder_closed(bot, closed_waits[0], group_text)
-        await edit_callback_message(callback, private_text)
-        await safe_callback_answer(callback, "Решение сохранено, сообщение в группе обновлено.")
+            selected_ids = decode_selected_wait_mask(source_waits, callback_args[0] if callback_args else "")
+            valid_ids = {item.id for item in source_waits}
+            selected_ids &= valid_ids
+            if not selected_ids:
+                await safe_callback_answer(callback, "Выберите хотя бы одного сотрудника для штрафа.", show_alert=True)
+                return
+            await apply_leader_decision(
+                callback,
+                bot,
+                app_storage,
+                settings,
+                wait,
+                now,
+                "fine",
+                fine_wait_ids=selected_ids,
+            )
+            return
+
+        if callback.message:
+            await bot.edit_message_reply_markup(
+                chat_id=callback.message.chat.id,
+                message_id=callback.message.message_id,
+                reply_markup=fine_selection_keyboard(
+                    source_waits,
+                    settings.fine_amount_rubles,
+                    selected_wait_ids=selected_ids,
+                ),
+            )
+        await safe_callback_answer(callback, "Отметьте сотрудников для штрафа.")
+        return
+
+    if action in {"fine", "nofine", "warning", "closeok"}:
+        await apply_leader_decision(callback, bot, app_storage, settings, wait, now, action)
         return
 
     if action in {"close", "confirmclose"}:
@@ -2353,7 +2658,7 @@ async def send_leader_decision_request(
         text,
         now,
         wait,
-        reply_markup=leader_decision_keyboard(wait, settings.fine_amount_rubles, enable_warning=settings.enable_warning_decision),
+        reply_markup=leader_decision_keyboard(waits, settings.fine_amount_rubles, enable_warning=settings.enable_warning_decision),
     )
     if not sent:
         return False
@@ -2362,6 +2667,8 @@ async def send_leader_decision_request(
         chat_id=wait.chat_id,
         source_message_ids=[item.source_message_id for item in waits],
         sent_at=now,
+        leader_chat_id=sent.chat.id,
+        leader_message_id=sent.message_id,
     )
     for item in waits:
         await app_storage.record_metric(
@@ -2382,15 +2689,15 @@ async def notify_leader(
     now: datetime,
     wait: PendingWait | None = None,
     reply_markup: InlineKeyboardMarkup | None = None,
-) -> bool:
+) -> Message | None:
     leader = await app_storage.get_user_by_username(settings.leader_username)
     if not leader or not leader["private_chat_started"]:
         logger.warning("Cannot notify leader @%s: private chat is not activated", settings.leader_username)
         await app_storage.record_metric("leader_notification_failed", now=now, wait_id=wait.id if wait else None)
-        return False
+        return None
 
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=leader["user_id"],
             text=text,
             disable_web_page_preview=True,
@@ -2400,10 +2707,10 @@ async def notify_leader(
     except TelegramAPIError:
         logger.exception("Cannot notify leader @%s", settings.leader_username)
         await app_storage.record_metric("leader_notification_failed", now=now, wait_id=wait.id if wait else None)
-        return False
+        return None
 
     await app_storage.record_metric("leader_notification_sent", now=now, wait_id=wait.id if wait else None)
-    return True
+    return sent
 
 
 async def send_group_reminder(

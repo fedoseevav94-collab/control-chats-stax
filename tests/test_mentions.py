@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, format_elapsed, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -161,6 +161,52 @@ def test_wait_keyboard_has_only_seen_and_close_buttons() -> None:
     labels = [button.text for row in keyboard.inline_keyboard for button in row]
 
     assert labels == ["👀 Вижу", "Закрыть"]
+
+
+def test_leader_decision_keyboard_uses_selection_for_multiple_targets() -> None:
+    waits = [
+        _wait(username="firstuser", display_name="@firstuser", user_id=None),
+        _wait(username="seconduser", display_name="@seconduser", user_id=None),
+    ]
+
+    keyboard = leader_decision_keyboard(waits, 500)
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "💰 Выбрать штрафы 500 ₽" in labels
+    assert "💰 Назначить штраф 500 ₽" not in labels
+
+
+def test_fine_selection_keyboard_can_select_one_target() -> None:
+    first = _wait(username="firstuser", display_name="@firstuser", user_id=None)
+    second = first.__class__(**{**first.__dict__, "id": 2, "username": "seconduser", "display_name": "@seconduser"})
+
+    keyboard = fine_selection_keyboard([first, second], 500, selected_wait_ids={2})
+    labels = [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "⬜ @firstuser" in labels
+    assert "✅ @seconduser" in labels
+    assert "💰 Подтвердить штраф 500 ₽" in labels
+
+
+def test_fine_selection_keyboard_callback_data_stays_short_for_many_targets() -> None:
+    base = _wait(username="user1", display_name="@user1", user_id=None)
+    waits = [
+        base.__class__(
+            **{
+                **base.__dict__,
+                "id": index,
+                "username": f"user{index}",
+                "display_name": f"@user{index}",
+            }
+        )
+        for index in range(1, 13)
+    ]
+
+    keyboard = fine_selection_keyboard(waits, 500, selected_wait_ids={wait.id for wait in waits})
+    callback_data_values = [button.callback_data for row in keyboard.inline_keyboard for button in row if button.callback_data]
+
+    assert callback_data_values
+    assert all(len(value.encode("utf-8")) <= 64 for value in callback_data_values)
 
 
 def test_control_buttons_are_limited_to_leader_or_target() -> None:
@@ -355,5 +401,7 @@ def _wait(
         delay_reason=None,
         delay_reason_at=None,
         leader_request_sent_at=None,
+        leader_request_chat_id=None,
+        leader_request_message_id=None,
         status="active",
     )
