@@ -419,7 +419,8 @@ RESPONSE_REQUEST_PHRASES = (
     "пригласите", "пригласи", "подключитесь", "подключись", "возьмите", "возьми",
     "нужно", "нужен", "нужна", "нужны", "надо", "необходимо", "требуется",
     "можешь", "можете", "можно", "просьба", "прошу", "пожалуйста",
-    "в работу", "на контроль", "на контроле", "ждем ответ", "ждём ответ",
+    "в работу", "на контроль", "на контроле", "ждем", "ждем тебя",
+    "ждем ответ", "ждём ответ", "жду", "жду ответ", "напоминаю", "напомню",
     "нет д/с", "нет дс", "нет денежных средств", "нет денег",
     "ругаются", "ругается", "жалуется", "жалуются",
 )
@@ -631,7 +632,8 @@ def response_contains_phrase(normalized: str, phrases: tuple[str, ...]) -> bool:
 def classify_employee_response(message: Message, settings: Settings | None = None) -> str:
     text = normalized_message_text(message)
     if not text:
-        return "full" if (message.photo or message.document or message.video or message.voice or message.audio) else "empty"
+        has_media = any(getattr(message, name, None) for name in ("photo", "document", "video", "voice", "audio"))
+        return "full" if has_media else "empty"
 
     normalized = normalized_match_text(text)
     compact = normalized.strip(" .,!?:;—-…")
@@ -1977,33 +1979,41 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     if reply_source_waits:
         if not can_user_control_waits(reply_source_waits, message.from_user, settings):
             return
-        await record_employee_message_events(app_storage, reply_source_waits, message, event_type="full_answer", now=now)
-        await close_waits_after_employee_message(
-            bot,
-            app_storage,
-            message,
-            reply_source_waits,
-            now,
-            settings,
-            metric_name="wait_closed_by_reply",
-            reason="ответил reply-ом",
-        )
+        response_type = classify_employee_response(message, settings)
+        if response_type == "full":
+            await record_employee_message_events(app_storage, reply_source_waits, message, event_type="full_answer", now=now)
+            await close_waits_after_employee_message(
+                bot,
+                app_storage,
+                message,
+                reply_source_waits,
+                now,
+                settings,
+                metric_name="wait_closed_by_reply",
+                reason="ответил reply-ом",
+            )
+        elif response_type in {"intermediate", "ambiguous"}:
+            await handle_intermediate_response(bot, app_storage, message, reply_source_waits, now, settings)
         return
 
     if sender_waits:
         answered_waits = single_source_waits(sender_waits)
         if answered_waits:
-            await record_employee_message_events(app_storage, answered_waits, message, event_type="full_answer", now=now)
-            await close_waits_after_employee_message(
-                bot,
-                app_storage,
-                message,
-                answered_waits,
-                now,
-                settings,
-                metric_name="wait_closed_by_single_active_message",
-                reason="ответил",
-            )
+            response_type = classify_employee_response(message, settings)
+            if response_type == "full":
+                await record_employee_message_events(app_storage, answered_waits, message, event_type="full_answer", now=now)
+                await close_waits_after_employee_message(
+                    bot,
+                    app_storage,
+                    message,
+                    answered_waits,
+                    now,
+                    settings,
+                    metric_name="wait_closed_by_single_active_message",
+                    reason="ответил",
+                )
+            elif response_type in {"intermediate", "ambiguous"}:
+                await handle_intermediate_response(bot, app_storage, message, answered_waits, now, settings)
         return
 
     if not actionable_mention_targets:

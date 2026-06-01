@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, classify_employee_response, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -62,6 +62,37 @@ def test_message_requires_response_for_question_with_mention() -> None:
     targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
 
     assert message_requires_response(message, targets)
+
+
+def test_message_requires_response_for_reminder_words_with_mention() -> None:
+    text = "@Norblacksmith напоминаю"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_message_requires_response_for_waiting_words_with_mention() -> None:
+    text = "@Norblacksmith ждем тебя в первой половине дня"
+    message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)
+    targets = [SimpleNamespace(identity="norblacksmith", display_name="@norblacksmith", username="norblacksmith")]
+
+    assert message_requires_response(message, targets)
+
+
+def test_short_waiting_reply_is_not_full_answer() -> None:
+    for text in ("минуту", "секунду", "уточняю", "сейчас уточню"):
+        message = SimpleNamespace(
+            text=text,
+            caption=None,
+            photo=None,
+            document=None,
+            video=None,
+            voice=None,
+            audio=None,
+        )
+
+        assert classify_employee_response(message) != "full"
 
 
 def test_message_without_mention_does_not_start_control_even_if_it_has_request() -> None:
