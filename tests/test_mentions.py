@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, classify_employee_response, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, classify_employee_response, direct_manager_mentions_for_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -183,6 +183,20 @@ def test_wait_targets_label_lists_unique_addresses() -> None:
     ]
 
     assert wait_targets_label(waits) == '@firstuser, <a href="tg://user?id=456">Hidden User</a>'
+
+
+def test_direct_manager_mentions_match_username() -> None:
+    settings = SimpleNamespace(direct_manager_escalations={"k_kram1": "dislavsergeevich"})
+    waits = [_wait(username="k_kram1", display_name="@k_kram1", user_id=None)]
+
+    assert direct_manager_mentions_for_waits(waits, settings) == "@dislavsergeevich"
+
+
+def test_direct_manager_mentions_match_display_name() -> None:
+    settings = SimpleNamespace(direct_manager_escalations={"полина": "dislavsergeevich"})
+    waits = [_wait(username="user_id:456", display_name="Полина", user_id=456)]
+
+    assert direct_manager_mentions_for_waits(waits, settings) == "@dislavsergeevich"
 
 
 def test_wait_keyboard_has_only_seen_and_close_buttons() -> None:

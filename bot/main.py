@@ -180,6 +180,28 @@ def wait_targets_label(waits: list[PendingWait]) -> str:
     return ", ".join(labels)
 
 
+def direct_manager_mentions_for_waits(waits: list[PendingWait], settings: Settings) -> str:
+    managers: list[str] = []
+    seen_managers: set[str] = set()
+    for wait in waits:
+        keys = {normalized_match_text(wait.username.removeprefix("@"))}
+        if wait.display_name:
+            display = normalized_match_text(wait.display_name.removeprefix("@"))
+            keys.add(display)
+            keys.update(part for part in re.split(r"\s+", display) if part)
+
+        manager = None
+        for key in keys:
+            manager = settings.direct_manager_escalations.get(key)
+            if manager:
+                break
+        if manager and manager not in seen_managers:
+            seen_managers.add(manager)
+            managers.append(display_username(manager))
+
+    return ", ".join(managers)
+
+
 def wait_keyboard(wait: PendingWait, settings: Settings | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2765,9 +2787,16 @@ async def send_group_reminder(
 
     reminder_prefix = f"Напоминание {next_reminder_number}."
     if should_request_leader:
+        direct_manager_mentions = direct_manager_mentions_for_waits(source_waits, settings)
+        direct_manager_line = (
+            f"\nПрямой руководитель: {direct_manager_mentions}, подключитесь, пожалуйста."
+            if direct_manager_mentions
+            else ""
+        )
         text = (
             f"{reminder_prefix} {target_labels}, ответа нет по сообщению: {reference}\n"
             "Запрос на решение отправлен руководителю."
+            f"{direct_manager_line}"
         )
     elif next_reminder_number == 2:
         text = (

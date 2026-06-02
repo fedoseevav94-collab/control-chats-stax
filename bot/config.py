@@ -26,6 +26,7 @@ class Settings:
     reminder_interval_minutes: int
     direct_message_after_minutes: int
     leader_username: str
+    direct_manager_escalations: dict[str, str]
     escalate_after_reminders: int
     max_group_reminders_if_dm_unreachable: int
     fine_amount_rubles: int
@@ -41,6 +42,20 @@ class Settings:
     database_path: Path
     scheduler_tick_seconds: int = 30
     scheduler_startup_grace_seconds: int = 45
+
+
+def _parse_direct_manager_escalations(value: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_pair in value.split(","):
+        pair = raw_pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        employee, manager = pair.split(":", maxsplit=1)
+        employee_key = employee.strip().removeprefix("@").casefold()
+        manager_username = manager.strip().removeprefix("@").casefold()
+        if employee_key and manager_username:
+            result[employee_key] = manager_username
+    return result
 
 
 def load_settings() -> Settings:
@@ -64,6 +79,9 @@ def load_settings() -> Settings:
         reminder_interval_minutes=env.int("REMINDER_INTERVAL_MINUTES", 15),
         direct_message_after_minutes=env.int("DIRECT_MESSAGE_AFTER_MINUTES", 60),
         leader_username=env.str("LEADER_USERNAME", "Fedos_AV").removeprefix("@").lower(),
+        direct_manager_escalations=_parse_direct_manager_escalations(
+            env.str("DIRECT_MANAGER_ESCALATIONS", "k_kram1:dislavsergeevich,полина:dislavsergeevich")
+        ),
         escalate_after_reminders=env.int("ESCALATE_AFTER_REMINDERS", 3),
         max_group_reminders_if_dm_unreachable=env.int("MAX_GROUP_REMINDERS_IF_DM_UNREACHABLE", 3),
         fine_amount_rubles=env.int("FINE_AMOUNT_RUBLES", 500),
