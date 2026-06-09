@@ -48,6 +48,17 @@ def test_extract_targets_reads_tg_user_text_links() -> None:
     assert targets[0].user_id == 456
 
 
+def test_plain_name_without_telegram_mention_is_not_a_target() -> None:
+    message = SimpleNamespace(
+        text="Полина, проверьте оплату",
+        caption=None,
+        entities=None,
+        caption_entities=None,
+    )
+
+    assert extract_mention_targets(message) == []
+
+
 def test_message_requires_response_for_direct_task_with_mention() -> None:
     text = "Оплатите заявку пожалуйста: 10009 @PolinaUser"
     message = SimpleNamespace(text=text, caption=None, photo=None, document=None, video=None)

@@ -1908,17 +1908,14 @@ async def handle_group_message(message: Message, bot: Bot, app_storage: Storage,
     sender_username = message.from_user.username.lower() if message.from_user and message.from_user.username else None
     sender_id = message.from_user.id if message.from_user else None
 
-    # New waits must start only from explicit Telegram mentions: @username,
-    # text_mention, or tg://user links. Plain names in normal text are used only
-    # to match already active waits, not to create new control tasks.
+    # New waits start only from explicit Telegram mentions: @username,
+    # text_mention, or tg://user links. Plain names in normal text must not
+    # create control tasks because several employees can share the same name.
     explicit_targets = extract_mention_targets(message)
-    target_candidates = explicit_targets
-    if message.photo or message.document or message.video:
-        target_candidates = await extend_targets_from_known_names(app_storage, message, explicit_targets)
 
     mention_targets = [
         target
-        for target in target_candidates
+        for target in explicit_targets
         if not (
             (sender_id is not None and target.user_id == sender_id)
             or (sender_username is not None and target.identity == sender_username)
