@@ -275,6 +275,21 @@ def parse_leader_snooze_input(text: str, now: datetime, settings: Settings) -> d
             raise ValueError("hours")
         return now + timedelta(hours=hours)
 
+    relative_day_match = re.search(r"\b(сегодня|завтра|послезавтра)\b", value)
+    if relative_day_match:
+        day_offsets = {"сегодня": 0, "завтра": 1, "послезавтра": 2}
+        target_date = now.date() + timedelta(days=day_offsets[relative_day_match.group(1)])
+        rest = (value[: relative_day_match.start()] + " " + value[relative_day_match.end() :]).strip()
+        time_match = re.search(r"(\d{1,2})(?::(\d{2}))?", rest)
+        if not time_match:
+            raise ValueError("time")
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2) or 0)
+        due_at = datetime.combine(target_date, time(hour=hour, minute=minute), tzinfo=settings.timezone)
+        if due_at <= now:
+            raise ValueError("past")
+        return due_at
+
     date_match = re.search(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?", value)
     if not date_match:
         raise ValueError("date")
@@ -306,7 +321,9 @@ def leader_snooze_prompt_text() -> str:
         "Когда напомнить по этому решению?\n\n"
         "Напишите дату и час одним сообщением, например:\n"
         "27.06 15\n"
-        "27.06 15:30\n\n"
+        "27.06 15:30\n"
+        "завтра в 10\n"
+        "сегодня в 17:30\n\n"
         "Или просто количество часов, например: 3"
     )
 

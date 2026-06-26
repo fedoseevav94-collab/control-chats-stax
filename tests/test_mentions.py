@@ -247,6 +247,27 @@ def test_parse_leader_snooze_input_accepts_date_and_time() -> None:
     assert parse_leader_snooze_input("27.06 15:30", now, settings) == datetime(2026, 6, 27, 15, 30, tzinfo=ZoneInfo("Europe/Moscow"))
 
 
+def test_parse_leader_snooze_input_accepts_tomorrow_phrase() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"))
+    now = datetime(2026, 6, 26, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert parse_leader_snooze_input("завтра в 10", now, settings) == datetime(2026, 6, 27, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+
+def test_parse_leader_snooze_input_accepts_today_phrase() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"))
+    now = datetime(2026, 6, 26, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert parse_leader_snooze_input("сегодня в 17:30", now, settings) == datetime(2026, 6, 26, 17, 30, tzinfo=ZoneInfo("Europe/Moscow"))
+
+
+def test_parse_leader_snooze_input_accepts_day_after_tomorrow_phrase() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"))
+    now = datetime(2026, 6, 26, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert parse_leader_snooze_input("послезавтра 12", now, settings) == datetime(2026, 6, 28, 12, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+
 def test_fine_selection_keyboard_can_select_one_target() -> None:
     first = _wait(username="firstuser", display_name="@firstuser", user_id=None)
     second = first.__class__(**{**first.__dict__, "id": 2, "username": "seconduser", "display_name": "@seconduser"})
