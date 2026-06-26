@@ -6,7 +6,7 @@ import io
 import html
 import logging
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -249,7 +249,8 @@ def decode_selected_wait_mask(waits: list[PendingWait], value: str | None) -> se
 
 def leader_decision_keyboard(waits: list[PendingWait], fine_amount: int, *, enable_warning: bool = True) -> InlineKeyboardMarkup:
     wait = waits[0]
-    buttons = [[InlineKeyboardButton(text="✅ Закрыть без штрафа", callback_data=f"wait:closeok:{wait.id}")]]
+    buttons = [[InlineKeyboardButton(text="⏰ Напомнить через", callback_data=f"wait:snooze:{wait.id}")]]
+    buttons.append([InlineKeyboardButton(text="✅ Закрыть без штрафа", callback_data=f"wait:closeok:{wait.id}")])
     if enable_warning:
         buttons.append([InlineKeyboardButton(text="⚠️ Предупреждение", callback_data=f"wait:warning:{wait.id}")])
     if len(waits) > 1:
@@ -260,6 +261,54 @@ def leader_decision_keyboard(waits: list[PendingWait], fine_amount: int, *, enab
     if wait.source_message_link:
         buttons.append([InlineKeyboardButton(text="Открыть сообщение", url=wait.source_message_link)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def parse_leader_snooze_input(text: str, now: datetime, settings: Settings) -> datetime:
+    value = normalized_match_text(text)
+    if not value:
+        raise ValueError("empty")
+
+    relative_match = re.fullmatch(r"(?:через\s+)?(\d{1,3})(?:\s*(?:ч|час|часа|часов))?", value)
+    if relative_match:
+        hours = int(relative_match.group(1))
+        if hours <= 0:
+            raise ValueError("hours")
+        return now + timedelta(hours=hours)
+
+    date_match = re.search(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?", value)
+    if not date_match:
+        raise ValueError("date")
+
+    day = int(date_match.group(1))
+    month = int(date_match.group(2))
+    year_raw = date_match.group(3)
+    year = int(year_raw) if year_raw else now.year
+    if year < 100:
+        year += 2000
+
+    rest = (value[: date_match.start()] + " " + value[date_match.end() :]).strip()
+    time_match = re.search(r"(\d{1,2})(?::(\d{2}))?", rest)
+    if not time_match:
+        raise ValueError("time")
+
+    hour = int(time_match.group(1))
+    minute = int(time_match.group(2) or 0)
+    due_at = datetime.combine(date(year, month, day), time(hour=hour, minute=minute), tzinfo=settings.timezone)
+    if due_at <= now and not year_raw:
+        due_at = datetime.combine(date(year + 1, month, day), time(hour=hour, minute=minute), tzinfo=settings.timezone)
+    if due_at <= now:
+        raise ValueError("past")
+    return due_at
+
+
+def leader_snooze_prompt_text() -> str:
+    return (
+        "Когда напомнить по этому решению?\n\n"
+        "Напишите дату и час одним сообщением, например:\n"
+        "27.06 15\n"
+        "27.06 15:30\n\n"
+        "Или просто количество часов, например: 3"
+    )
 
 
 def fine_selection_keyboard(
@@ -1650,6 +1699,68 @@ async def chat_id_command(message: Message, app_storage: Storage, settings: Sett
     )
 
 
+@router.message(F.chat.type == ChatType.PRIVATE)
+async def leader_snooze_input_message(message: Message, bot: Bot, app_storage: Storage, settings: Settings) -> None:
+    await register_user_from_message(app_storage, message, settings)
+    if not is_leader(message.from_user, settings) or not message.from_user:
+        return
+    if not message.text or message.text.startswith("/"):
+        return
+
+    snooze = await app_storage.get_pending_leader_snooze_input(leader_user_id=message.from_user.id)
+    if not snooze:
+        return
+
+    now = now_in_tz(settings)
+    wait = await app_storage.get_wait_by_id(snooze.wait_id)
+    if not wait or wait.status != "active":
+        await app_storage.cancel_leader_snooze(snooze_id=snooze.id, now=now)
+        await message.answer("Это обращение уже закрыто, напоминание не нужно.")
+        return
+
+    try:
+        due_at = parse_leader_snooze_input(message.text, now, settings)
+    except ValueError:
+        await message.answer(
+            "Не понял время. Напишите, например: 27.06 15, 27.06 15:30 или просто 3, чтобы напомнить через 3 часа."
+        )
+        return
+
+    await app_storage.schedule_leader_snooze(snooze_id=snooze.id, due_at=due_at, now=now)
+    due_label = format_event_dt(due_at, settings)
+    await message.answer(f"Хорошо, напомню по этому решению: {due_label}.")
+
+    source_waits = await app_storage.active_waits_for_source_message(
+        chat_id=wait.chat_id,
+        source_message_id=wait.source_message_id,
+    )
+    try:
+        await bot.send_message(
+            chat_id=wait.chat_id,
+            text=(
+                "Руководитель дал отсрочку на ответ.\n"
+                f"До: {due_label}\n"
+                f"Адресаты: {wait_targets_label(source_waits or [wait])}\n"
+                f"Исходное обращение: {source_reference(wait.source_message_link, wait.source_quote)}"
+            ),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_parameters=ReplyParameters(message_id=wait.source_message_id, allow_sending_without_reply=True),
+        )
+    except TelegramAPIError:
+        logger.exception("Cannot send leader snooze notice to chat %s", wait.chat_id)
+
+    if snooze.leader_request_chat_id and snooze.leader_request_message_id:
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=snooze.leader_request_chat_id,
+                message_id=snooze.leader_request_message_id,
+                reply_markup=None,
+            )
+        except TelegramAPIError:
+            logger.exception("Cannot remove keyboard from snoozed leader request %s", snooze.leader_request_message_id)
+
+
 @router.message(F.text.regexp(r"(?i)^\s*(закрыть|отложить)\s*$"))
 async def text_action_command(message: Message, bot: Bot, app_storage: Storage, settings: Settings) -> None:
     await register_user_from_message(app_storage, message, settings)
@@ -2453,6 +2564,28 @@ async def wait_callback(callback: CallbackQuery, bot: Bot, app_storage: Storage,
         await safe_callback_answer(callback, "Причина сохранена.")
         return
 
+    if action == "snooze":
+        if callback.message is None or callback.message.chat.type != ChatType.PRIVATE:
+            await safe_callback_answer(callback, "Отложить решение можно только в личке с ботом.", show_alert=True)
+            return
+        if not is_leader(callback.from_user, settings):
+            await safe_callback_answer(
+                callback,
+                f"Решение может отложить только {display_username(settings.leader_username)}.",
+                show_alert=True,
+            )
+            return
+        await app_storage.create_leader_snooze_input(
+            leader_user_id=callback.from_user.id,
+            wait=wait,
+            request_chat_id=callback.message.chat.id,
+            request_message_id=callback.message.message_id,
+            now=now,
+        )
+        await callback.message.answer(leader_snooze_prompt_text())
+        await safe_callback_answer(callback, "Жду дату и время напоминания.")
+        return
+
     if action in {"fineselect", "finetoggle", "finecancel", "fineconfirm"}:
         if not is_leader(callback.from_user, settings):
             await safe_callback_answer(
@@ -2976,6 +3109,50 @@ async def send_direct_message_if_needed(
     )
 
 
+async def send_due_leader_snoozes(bot: Bot, app_storage: Storage, settings: Settings, now: datetime) -> None:
+    for snooze in await app_storage.due_leader_snoozes(now=now):
+        source_waits = await app_storage.active_waits_for_source_message(
+            chat_id=snooze.chat_id,
+            source_message_id=snooze.source_message_id,
+        )
+        if not source_waits:
+            await app_storage.cancel_leader_snooze(snooze_id=snooze.id, now=now)
+            continue
+
+        text = (
+            "Напоминаю по отложенному решению.\n\n"
+            + await leader_request_text(app_storage, settings, source_waits, now)
+        )
+        sent = await notify_leader(
+            bot,
+            app_storage,
+            settings,
+            text,
+            now,
+            source_waits[0],
+            reply_markup=leader_decision_keyboard(
+                source_waits,
+                settings.fine_amount_rubles,
+                enable_warning=settings.enable_warning_decision,
+            ),
+        )
+        if sent:
+            await app_storage.mark_leader_request_sent_for_source(
+                chat_id=source_waits[0].chat_id,
+                source_message_ids=[item.source_message_id for item in source_waits],
+                sent_at=now,
+                leader_chat_id=sent.chat.id,
+                leader_message_id=sent.message_id,
+            )
+            await app_storage.mark_leader_snooze_done(snooze_id=snooze.id, now=now)
+            await app_storage.record_metric(
+                "leader_decision_snooze_sent",
+                now=now,
+                chat_id=source_waits[0].chat_id,
+                wait_id=source_waits[0].id,
+            )
+
+
 async def send_daily_reports_if_due(bot: Bot, app_storage: Storage, settings: Settings, now: datetime) -> None:
     if not daily_report_is_due(now, settings):
         return
@@ -3056,6 +3233,7 @@ async def scheduler_loop(bot: Bot, app_storage: Storage, settings: Settings) -> 
     while True:
         now = now_in_tz(settings)
         await send_daily_reports_if_due(bot, app_storage, settings, now)
+        await send_due_leader_snoozes(bot, app_storage, settings, now)
         due_waits = await app_storage.due_waits(now)
 
         if due_waits and not is_work_time(now, settings.workday_start, settings.workday_end, settings.timezone):

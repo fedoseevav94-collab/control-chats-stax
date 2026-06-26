@@ -15,6 +15,21 @@ def dt_from_db(value: str) -> datetime:
 
 
 @dataclass(frozen=True)
+class LeaderSnooze:
+    id: int
+    leader_user_id: int
+    wait_id: int
+    chat_id: int
+    source_message_id: int
+    leader_request_chat_id: int | None
+    leader_request_message_id: int | None
+    due_at: datetime | None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
 class PendingWait:
     id: int
     chat_id: int
@@ -260,6 +275,25 @@ class Storage:
                 ON wait_events(wait_id, event_type, created_at);
             CREATE INDEX IF NOT EXISTS idx_wait_events_user
                 ON wait_events(username_lower, user_id, event_type, created_at);
+
+            CREATE TABLE IF NOT EXISTS leader_snoozes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                leader_user_id INTEGER NOT NULL,
+                wait_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                source_message_id INTEGER NOT NULL,
+                leader_request_chat_id INTEGER,
+                leader_request_message_id INTEGER,
+                due_at TEXT,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_leader_snoozes_due
+                ON leader_snoozes(status, due_at);
+            CREATE INDEX IF NOT EXISTS idx_leader_snoozes_input
+                ON leader_snoozes(status, leader_user_id, updated_at);
             """
         )
         await self._add_column_if_missing("waits", "direct_message_attempted_at", "TEXT")
@@ -277,6 +311,106 @@ class Storage:
         await self._add_column_if_missing("waits", "seen_by_user_id", "INTEGER")
         await self._add_column_if_missing("waits", "seen_at", "TEXT")
         await self.conn.commit()
+
+    async def create_leader_snooze_input(
+        self,
+        *,
+        leader_user_id: int,
+        wait: PendingWait,
+        request_chat_id: int | None,
+        request_message_id: int | None,
+        now: datetime,
+    ) -> None:
+        await self.conn.execute(
+            """
+            UPDATE leader_snoozes
+            SET status = 'cancelled', updated_at = ?
+            WHERE leader_user_id = ? AND status = 'awaiting_input'
+            """,
+            (dt_to_db(now), leader_user_id),
+        )
+        await self.conn.execute(
+            """
+            INSERT INTO leader_snoozes (
+                leader_user_id, wait_id, chat_id, source_message_id,
+                leader_request_chat_id, leader_request_message_id,
+                due_at, status, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, NULL, 'awaiting_input', ?, ?)
+            """,
+            (
+                leader_user_id,
+                wait.id,
+                wait.chat_id,
+                wait.source_message_id,
+                request_chat_id,
+                request_message_id,
+                dt_to_db(now),
+                dt_to_db(now),
+            ),
+        )
+        await self.conn.commit()
+
+    async def get_pending_leader_snooze_input(self, *, leader_user_id: int) -> LeaderSnooze | None:
+        cursor = await self.conn.execute(
+            """
+            SELECT *
+            FROM leader_snoozes
+            WHERE leader_user_id = ? AND status = 'awaiting_input'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (leader_user_id,),
+        )
+        row = await cursor.fetchone()
+        return self._leader_snooze(row) if row else None
+
+    async def schedule_leader_snooze(self, *, snooze_id: int, due_at: datetime, now: datetime) -> None:
+        await self.conn.execute(
+            """
+            UPDATE leader_snoozes
+            SET due_at = ?, status = 'scheduled', updated_at = ?
+            WHERE id = ? AND status = 'awaiting_input'
+            """,
+            (dt_to_db(due_at), dt_to_db(now), snooze_id),
+        )
+        await self.conn.commit()
+
+    async def due_leader_snoozes(self, *, now: datetime) -> list[LeaderSnooze]:
+        cursor = await self.conn.execute(
+            """
+            SELECT *
+            FROM leader_snoozes
+            WHERE status = 'scheduled' AND due_at <= ?
+            ORDER BY due_at, id
+            """,
+            (dt_to_db(now),),
+        )
+        rows = await cursor.fetchall()
+        return [self._leader_snooze(row) for row in rows]
+
+    async def mark_leader_snooze_done(self, *, snooze_id: int, now: datetime) -> None:
+        await self.conn.execute(
+            """
+            UPDATE leader_snoozes
+            SET status = 'done', updated_at = ?
+            WHERE id = ?
+            """,
+            (dt_to_db(now), snooze_id),
+        )
+        await self.conn.commit()
+
+    async def cancel_leader_snooze(self, *, snooze_id: int, now: datetime) -> None:
+        await self.conn.execute(
+            """
+            UPDATE leader_snoozes
+            SET status = 'cancelled', updated_at = ?
+            WHERE id = ?
+            """,
+            (dt_to_db(now), snooze_id),
+        )
+        await self.conn.commit()
+
 
     async def leader_daily_report_was_sent(self, *, report_date: date) -> bool:
         cursor = await self.conn.execute(
@@ -1326,6 +1460,22 @@ class Storage:
         cursor = await self.conn.execute("SELECT count(*) AS total FROM waits WHERE status = 'closed'")
         summary["closed_waits_total"] = (await cursor.fetchone())["total"]
         return summary
+
+    def _leader_snooze(self, row: aiosqlite.Row) -> LeaderSnooze:
+        return LeaderSnooze(
+            id=row["id"],
+            leader_user_id=row["leader_user_id"],
+            wait_id=row["wait_id"],
+            chat_id=row["chat_id"],
+            source_message_id=row["source_message_id"],
+            leader_request_chat_id=row["leader_request_chat_id"],
+            leader_request_message_id=row["leader_request_message_id"],
+            due_at=dt_from_db(row["due_at"]) if row["due_at"] else None,
+            status=row["status"],
+            created_at=dt_from_db(row["created_at"]),
+            updated_at=dt_from_db(row["updated_at"]),
+        )
+
 
     def _pending_wait(self, row: aiosqlite.Row) -> PendingWait:
         return PendingWait(

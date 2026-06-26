@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, classify_employee_response, direct_manager_mentions_for_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, classify_employee_response, direct_manager_mentions_for_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, parse_leader_snooze_input, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
 
@@ -228,8 +228,23 @@ def test_leader_decision_keyboard_uses_selection_for_multiple_targets() -> None:
     keyboard = leader_decision_keyboard(waits, 500)
     labels = [button.text for row in keyboard.inline_keyboard for button in row]
 
+    assert "⏰ Напомнить через" in labels
     assert "💰 Выбрать штрафы 500 ₽" in labels
     assert "💰 Назначить штраф 500 ₽" not in labels
+
+
+def test_parse_leader_snooze_input_accepts_relative_hours() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"))
+    now = datetime(2026, 6, 26, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert parse_leader_snooze_input("3", now, settings) == datetime(2026, 6, 26, 13, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+
+def test_parse_leader_snooze_input_accepts_date_and_time() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"))
+    now = datetime(2026, 6, 26, 10, 0, tzinfo=ZoneInfo("Europe/Moscow"))
+
+    assert parse_leader_snooze_input("27.06 15:30", now, settings) == datetime(2026, 6, 27, 15, 30, tzinfo=ZoneInfo("Europe/Moscow"))
 
 
 def test_fine_selection_keyboard_can_select_one_target() -> None:
