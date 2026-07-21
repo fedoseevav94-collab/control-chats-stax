@@ -1066,9 +1066,9 @@ def format_elapsed(start_at: datetime, end_at: datetime) -> str:
     elif start_at.tzinfo is not None and end_at.tzinfo is None:
         end_at = end_at.replace(tzinfo=start_at.tzinfo)
     elapsed_seconds = max(0, int((end_at - start_at).total_seconds()))
-    elapsed_minutes = elapsed_seconds // 60
-    if elapsed_minutes < 1:
+    if elapsed_seconds < 60:
         return "меньше минуты"
+    elapsed_minutes = (elapsed_seconds + 59) // 60
 
     elapsed_hours = elapsed_minutes // 60
     minutes = elapsed_minutes % 60
