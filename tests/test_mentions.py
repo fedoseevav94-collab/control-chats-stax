@@ -5,9 +5,25 @@ from zoneinfo import ZoneInfo
 from aiogram.enums import MessageEntityType
 from aiogram.types import MessageEntity, User
 
-from bot.main import can_user_control_waits, classify_employee_response, direct_manager_mentions_for_waits, fine_selection_keyboard, format_elapsed, leader_decision_keyboard, message_requires_response, parse_leader_snooze_input, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
+from bot.main import can_user_control_waits, classify_employee_response, direct_manager_mentions_for_waits, event_time_in_tz, fine_selection_keyboard, format_elapsed, format_event_dt, leader_decision_keyboard, message_requires_response, parse_leader_snooze_input, select_waits_answered_by_message, single_source_waits, source_history_lines, source_text_match_score, wait_keyboard, wait_matches_sender_display, wait_matches_telegram_user, wait_target_label, wait_targets_label
 from bot.storage import PendingWait
 from bot.telegram_utils import extract_mention_targets, source_reference
+
+
+def test_event_time_is_displayed_in_settings_timezone() -> None:
+    settings = SimpleNamespace(timezone=ZoneInfo("Europe/Moscow"), timezone_name="Europe/Moscow")
+    telegram_utc_time = datetime(2026, 7, 21, 8, 4, tzinfo=ZoneInfo("UTC"))
+
+    assert format_event_dt(telegram_utc_time, settings) == "21.07 11:04 МСК"
+    assert event_time_in_tz(telegram_utc_time, settings).hour == 11
+
+
+def test_elapsed_from_source_to_answer_uses_actual_event_time() -> None:
+    moscow = ZoneInfo("Europe/Moscow")
+    source_time = datetime(2026, 7, 21, 10, 45, tzinfo=moscow)
+    answer_time = datetime(2026, 7, 21, 11, 4, tzinfo=moscow)
+
+    assert format_elapsed(source_time, answer_time) == "19 минут"
 
 
 def test_extract_targets_reads_text_mentions_and_plain_mentions() -> None:

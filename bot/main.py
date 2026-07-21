@@ -6,7 +6,7 @@ import io
 import html
 import logging
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatType
@@ -60,6 +60,14 @@ UNCLEAR_RESPONSE_RE = re.compile("|".join(f"(?:{pattern})" for pattern in UNCLEA
 
 def now_in_tz(settings: Settings) -> datetime:
     return datetime.now(settings.timezone)
+
+
+def event_time_in_tz(value: datetime | None, settings: Settings) -> datetime:
+    if value is None:
+        return now_in_tz(settings)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(settings.timezone)
 
 
 def is_leader(user: User | None, settings: Settings) -> bool:
@@ -1025,7 +1033,7 @@ async def safe_callback_answer(callback: CallbackQuery, text: str, *, show_alert
 
 
 def format_local_dt(value: datetime, settings: Settings) -> str:
-    return value.astimezone(settings.timezone).strftime("%d.%m %H:%M")
+    return event_time_in_tz(value, settings).strftime("%d.%m %H:%M")
 
 
 def timezone_label(settings: Settings) -> str:
@@ -1053,6 +1061,10 @@ def plural_ru(value: int, forms: tuple[str, str, str]) -> str:
 
 
 def format_elapsed(start_at: datetime, end_at: datetime) -> str:
+    if start_at.tzinfo is None and end_at.tzinfo is not None:
+        start_at = start_at.replace(tzinfo=end_at.tzinfo)
+    elif start_at.tzinfo is not None and end_at.tzinfo is None:
+        end_at = end_at.replace(tzinfo=start_at.tzinfo)
     elapsed_seconds = max(0, int((end_at - start_at).total_seconds()))
     elapsed_minutes = elapsed_seconds // 60
     if elapsed_minutes < 1:
@@ -1808,18 +1820,18 @@ async def text_action_command(message: Message, bot: Bot, app_storage: Storage, 
         await message.reply("Закрыть обращение может руководитель или адресат обращения.")
         return
 
-    now = now_in_tz(settings)
+    action_at = event_time_in_tz(message.date, settings)
     await resolve_user_id_for_matching_waits(app_storage, source_waits, message.from_user)
     closed_waits = await app_storage.close_waits_for_source_messages(
         chat_id=wait.chat_id,
         source_message_ids=[wait.source_message_id],
         closed_by_user_id=message.from_user.id,
-        now=now,
+        now=action_at,
     )
     if closed_waits:
         await app_storage.record_metric(
             "wait_closed_by_text_command",
-            now=now,
+            now=action_at,
             chat_id=wait.chat_id,
             username_lower=wait.username,
             wait_id=wait.id,
@@ -1830,7 +1842,7 @@ async def text_action_command(message: Message, bot: Bot, app_storage: Storage, 
             closed_waits,
             actor_label(message.from_user),
             "закрыл обращение",
-            message.date,
+            action_at,
             settings,
             time_label="Время закрытия",
         )
@@ -1849,19 +1861,20 @@ async def close_waits_after_employee_message(
 ) -> None:
     sender_username = message.from_user.username.lower() if message.from_user and message.from_user.username else None
     sender_id = message.from_user.id if message.from_user else None
+    action_at = event_time_in_tz(message.date, settings)
     source_message_ids = [wait.source_message_id for wait in waits]
     closed_waits = await app_storage.close_waits_for_source_messages(
         chat_id=message.chat.id,
         source_message_ids=source_message_ids,
         closed_by_user_id=sender_id,
-        now=now,
+        now=action_at,
     )
     if not closed_waits:
         return
 
     await app_storage.record_metric(
         metric_name,
-        now=now,
+        now=action_at,
         chat_id=message.chat.id,
         username_lower=sender_username,
         value=len(closed_waits),
@@ -1872,7 +1885,7 @@ async def close_waits_after_employee_message(
         closed_waits,
         actor_label(message.from_user),
         reason,
-        message.date,
+        action_at,
         settings,
         time_label=time_label,
     )
@@ -2189,6 +2202,7 @@ async def handle_message_reaction(
         return
 
     now = now_in_tz(settings)
+    action_at = event_time_in_tz(event.date, settings)
     await app_storage.upsert_user(
         user_id=event.user.id,
         username=event.user.username,
@@ -2226,7 +2240,7 @@ async def handle_message_reaction(
         chat_id=event.chat.id,
         source_message_ids=source_message_ids,
         closed_by_user_id=event.user.id,
-        now=now,
+        now=action_at,
     )
     if not closed_waits:
         return
@@ -2234,7 +2248,7 @@ async def handle_message_reaction(
     await app_storage.record_wait_events(
         closed_waits,
         event_type="reaction",
-        created_at=now,
+        created_at=action_at,
         actor_user_id=event.user.id,
         actor_label=actor_label(event.user),
         text="reaction",
@@ -2242,12 +2256,12 @@ async def handle_message_reaction(
     username = event.user.username.lower() if event.user.username else None
     await app_storage.record_metric(
         "wait_closed_by_reaction",
-        now=now,
+        now=action_at,
         chat_id=event.chat.id,
         username_lower=username,
         value=len(closed_waits),
     )
-    await mark_waits_closed(bot, closed_waits, actor_label(event.user), "поставил реакцию", event.date, settings)
+    await mark_waits_closed(bot, closed_waits, actor_label(event.user), "поставил реакцию", action_at, settings)
 
 
 async def apply_leader_decision(
