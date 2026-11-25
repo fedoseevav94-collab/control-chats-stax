@@ -8,20 +8,20 @@ import logging
 import os
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup
 
 LOG = logging.getLogger(__name__)
 TZ = ZoneInfo("Europe/Moscow")
 MANAGERS = {"pagorodu": "Арман", "lalalas19": "Рафаэль", "serb_98": "Александр Петрович"}
 STATUS = {
-    "new": "Требуется ответ", "order": "Не заказано", "partial": "Заказано частично",
+    "new": "Требуется ответ", "order": "Нужно заказать", "partial": "Заказано частично",
     "payment": "Заказано — ждём оплату", "disassembly": "Ждём разбор",
     "blocked": "Не можем заказать", "approval": "Ждём подтверждение руководителя",
     "closed": "Закрыто",
@@ -29,6 +29,8 @@ STATUS = {
 CHOICES = {"order": "Нужно заказать", "partial": "Заказано частично", "payment": "Всё заказано — ждём оплату",
            "paid": "Всё заказано и оплачено", "disassembly": "Ждём разбор", "blocked": "Не можем заказать",
            "repaired": "Уже отремонтирована", "unneeded": "Ремонт не требуется"}
+NEED_PARTS = ("order", "partial", "payment", "paid")
+COMMENT_REQUIRED = ("partial", "blocked", "repaired", "unneeded", "keep")
 TRANS = str.maketrans("ABEKMHOPCTYX", "АВЕКМНОРСТУХ")
 
 
@@ -42,11 +44,14 @@ def normalize(value):
 
 def plates(text, fleet):
     text = text.upper().translate(TRANS)
-    found = re.findall(r"(?<![А-ЯA-Z0-9])[АВЕКМНОРСТУХ]\s*\d{3}\s*[АВЕКМНОРСТУХ]{2}\s*\d{2,3}(?!\d)", text)
+    sep = r"[\s_-]*"  # допускаем пробелы, дефисы и подчёркивания внутри номера: В326СВ-761, В326СВ_761.zip
+    found = re.findall(r"(?<![А-ЯA-Z0-9])[АВЕКМНОРСТУХ]" + sep + r"\d{3}" + sep + r"[АВЕКМНОРСТУХ]{2}"
+                       + sep + r"\d{2,3}(?!\d)", text)
     result = {normalize(p) for p in found}
-    # Exact known unusual identifiers, e.g. ЕС53674. Never guess their format.
+    # Exact known unusual identifiers, e.g. ЕС53674 / ЕС 53674. Never guess their format.
     for plate in fleet:
-        if re.search(r"(?<![А-ЯA-Z0-9])" + re.escape(plate) + r"(?![А-ЯA-Z0-9])", text):
+        pattern = sep.join(re.escape(ch) for ch in plate)
+        if re.search(r"(?<![А-ЯA-Z0-9])" + pattern + r"(?![А-ЯA-Z0-9])", text):
             result.add(plate)
     return sorted(result)
 
@@ -73,14 +78,31 @@ def parse_date(text, current):
     return value
 
 
-def accident_date(text):
-    match = re.search(r"дтп\s*(?:от\s*)?(\d{2}\.\d{2}\.\d{4})", text, re.I)
-    if match:
+DATE = r"(\d{1,2})[./-](\d{1,2})"
+
+
+def accident_date(text, today=None):
+    """Дата ДТП: «ДТП от 24.11.2026», «ДТП 24.11», «дтп 24.11.26», «ДТП_24-11-2026.zip»,
+    а если слова «ДТП» рядом нет — первая полная дата в тексте (24.11.2026 / 24.11.26)."""
+    today = today or now().date()
+    match = re.search(r"дтп[\W_]{0,10}(?:от[\W_]{0,3})?" + DATE + r"(?:[./-](\d{4}|\d{2}))?(?!\d)", text, re.I)
+    if not match:
+        match = re.search(r"(?<![\d.])" + DATE + r"[./-](\d{4}|\d{2})(?![\d])", text)
+    if not match:
+        return None
+    day, month, year = int(match[1]), int(match[2]), match[3]
+    try:
+        value = date(int(year) + (2000 if len(year) == 2 else 0) if year else today.year, month, day)
+    except ValueError:
+        return None
+    if not year and value > today:
         try:
-            return datetime.strptime(match[1], "%d.%m.%Y").date().isoformat()
+            value = value.replace(year=value.year - 1)
         except ValueError:
-            pass
-    return None
+            return None
+    if value > today + timedelta(days=1) or value < today - timedelta(days=730):
+        return None
+    return value.isoformat()
 
 
 def repair_notice(text):
@@ -143,15 +165,58 @@ class Parts:
         return self.role(user)
 
     def access(self, job, role):
+        # Любой менеджер может открыть любую заявку и выполнить действие — тогда она закрепится за ним.
+        return role == "leader" or role in MANAGERS
+
+    def owns(self, job, role):
+        # Списки «Мои заявки» / «Просроченные»: менеджеру — только закреплённые за ним.
         return role == "leader" or (role in MANAGERS and job["manager"] == role)
+
+    def take_over(self, job, role, actor):
+        """Менеджер выбрал действие в чужой заявке — закрепляем заявку за ним."""
+        if role not in MANAGERS or job["manager"] == role:
+            return False
+        previous = job["manager"]
+        job["manager"] = role
+        job["version"] += 1
+        self.audit(actor, "take over from " + (previous or "—"), job)
+        self.publish(job)
+        self.alert(job, f"🔁 Заявку взял @{role}" + (f" (ранее @{previous})" if previous else "") + ".",
+                   dm_to=previous, dm_text=f"🔁 Вашу заявку взял {MANAGERS.get(role, role)}.")
+        return True
 
     def audit(self, actor, action, job=None):
         self.data["history"].append({"at": now().isoformat(), "actor": actor, "action": action,
                                      "job": dict(job) if job else None})
 
-    def enqueue(self, key, text, job=None, chat=None):
+    def enqueue(self, key, text, job=None, chat=None, **extra):
         if key not in self.data["outbox"]:
-            self.data["outbox"][key] = {"chat": chat, "text": text, "job": job, "sent": False}
+            self.data["outbox"][key] = {"chat": chat, "text": text, "job": job, "sent": False, **extra}
+
+    def dm(self, key, username, text, job=None, rows=None):
+        """Личное сообщение сотруднику (если он нажимал /start). Не доставлено — не повторяем бесконечно."""
+        uid = self.data["leader_id"] if username == self.leader else self.data["users"].get(username)
+        if uid:
+            self.enqueue("dm:" + key, text, job, chat=uid, kind="dm", rows=rows)
+
+    def short(self, job):
+        return f"№{job['id']} {job['plate']} — {job['model']}"
+
+    def alert(self, job, text, dm_to=None, dm_text=None):
+        """Короткий сигнал в группу (там, где нужна реакция) + дубль в личку."""
+        key = f"alert:{job['id']}:{len(self.data['history'])}"
+        self.enqueue(key, text + "\n" + self.short(job), job["id"])
+        if dm_to:
+            self.dm(key, dm_to, (dm_text or text) + "\n" + self.short(job), job["id"])
+
+    def unclear(self, key, event):
+        text = ("❓ Нужно уточнить сообщение из группы ДТП: " + ", ".join(event["pending"])
+                + "\nОткройте в боте «Требуют уточнения».\n" + event["link"])
+        if self.data["leader_id"]:
+            self.enqueue("unclear:" + key, text, chat=self.data["leader_id"], kind="dm",
+                         rows=[[["Требуют уточнения", "inbox:0"]]])
+        else:
+            self.enqueue("unclear:" + key, f"@{self.leader}, " + text)
 
     def card(self, job):
         manager = "@" + job["manager"] if job["manager"] else "не определён"
@@ -167,9 +232,26 @@ class Parts:
         return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
             text="Открыть заявку в боте", url=f"https://t.me/{self.username}?start=parts_{job}")]])
 
-    def publish(self, job, message="Обновление заявки"):
-        key = f"job:{job['id']}:{len(self.data['history'])}"
-        self.enqueue(key, message + "\n\n" + self.card(job), job["id"])
+    def render(self, job):
+        """Текст единственной карточки заявки в группе — всегда актуальный."""
+        icon = {"closed": "✅", "approval": "🟡"}.get(job["status"], "🚨")
+        text = f"{icon} ДТП — " + self.card(job).replace("Заявка №", "заявка №", 1)
+        if job.get("date"):
+            text += "\nДата ДТП: " + date.fromisoformat(job["date"]).strftime("%d.%m.%Y")
+        link = self.data["events"].get(job["sources"][0], {}).get("link") if job["sources"] else ""
+        if link:
+            text += "\nИсточник: " + link
+        if not job["manager"] and job["status"] != "closed":
+            text += f"\n\n@{self.leader}, определите менеджера."
+        return text + "\n\nОбновлено: " + now().strftime("%d.%m %H:%M")
+
+    def publish(self, job, message=None):
+        """Карточка заявки: первая публикация — новое сообщение, дальше — правка того же сообщения."""
+        if f"card:{job['id']}" not in self.data["outbox"]:
+            self.enqueue(f"card:{job['id']}", "", job["id"], kind="card")
+        else:
+            self.data["outbox"][f"edit:{job['id']}"] = {"chat": None, "text": "", "job": job["id"],
+                                                        "sent": False, "kind": "edit"}
         self.save()
 
     def new_job(self, plate, event, date=None):
@@ -180,7 +262,9 @@ class Parts:
                "due": deadline(now()).isoformat(), "sources": [event], "request": None, "version": 0}
         self.data["jobs"][jid] = job
         self.audit("bot", "created", job)
-        self.publish(job, "Новое сообщение о ДТП" + (f"\n@{self.leader}, определите менеджера." if not job["manager"] else ""))
+        self.publish(job)
+        if job["manager"]:
+            self.dm(f"new:{jid}", job["manager"], "🚨 Новая заявка на вас: проверьте заказ запчастей.\n" + self.short(job), jid)
         return job
 
     async def show(self, bot, chat, job, role):
@@ -189,18 +273,22 @@ class Parts:
             return
         jid, version = job["id"], job["version"]
         rows = []
+        foreign = role in MANAGERS and job["manager"] != role and job["status"] not in ("closed", "approval")
         if job["status"] == "approval":
             if role == "leader":
                 rows = [[("Подтвердить закрытие", f"approve:{jid}:{version}"), ("Вернуть в работу", f"reject:{jid}:{version}")]]
         elif job["status"] != "closed":
             rows = [[(label, f"state:{jid}:{version}:{code}")] for code, label in CHOICES.items()]
             rows += [[("Машина не моя", f"reassign:{jid}:{version}")], [("Комментарий / перенос срока", f"state:{jid}:{version}:keep")]]
-        rows.append([("К списку заявок", "list:0")])
+        rows.append([("📋 К списку заявок", "list:0"), ("🏠 Меню", "home:main")])
         source = job["sources"][-1]
         msg = self.data["events"].get(source, {})
         text = self.card(job)
         if msg.get("link"):
             text += "\nИсточник: " + msg["link"]
+        if foreign:
+            text += ("\n\n⚠️ Заявка закреплена за " + ("@" + job["manager"] if job["manager"] else "никем")
+                     + ". Если выберете действие, она перейдёт к вам.")
         await bot.send_message(chat, text, reply_markup=keyboard(rows))
 
     async def menu(self, bot, chat, role):
@@ -267,6 +355,25 @@ class Parts:
         event = {"text": text[:3000], "plates": found, "pending": [], "done": [], "date": accident_date(text),
                  "link": f"https://t.me/c/{str(message.chat.id)[4:]}/{message.message_id}" if str(message.chat.id).startswith("-100") else ""}
         self.data["events"][key] = event
+        album_id = getattr(message, "media_group_id", None)
+        if album_id:
+            # Альбом: подпись с номером обычно только у одного фото. Остальные фото берут номер из неё.
+            album = self.data.setdefault("albums", {}).setdefault(str(album_id), {
+                "keys": [], "plates": [], "date": None, "jobs": [], "flagged": False, "at": None})
+            album["keys"].append(key)
+            album["at"] = now().isoformat()
+            event["album"] = str(album_id)
+            if not found:
+                if album["plates"]:
+                    event["plates"] = list(album["plates"])
+                    for jid in album["jobs"]:
+                        self.data["jobs"][jid]["sources"].append(key)
+                self.save()
+                return  # без номера: ждём подпись; если её не будет — одно уточнение на весь альбом (см. tick)
+            if album["plates"]:
+                self.save()
+                return  # номер в альбоме уже обработан
+            album["plates"], album["date"] = found, event["date"]
         if not found:
             if message.document or message.photo or re.search(r"дтп|авар|осмотр|ремонт", text, re.I):
                 event["pending"] = ["?"]
@@ -276,9 +383,12 @@ class Parts:
                 job = jobs[-1] if jobs else None
                 manager = (job or self.fleet.get(plate, {})).get("manager")
                 tag = "@" + (manager or self.leader)
-                self.enqueue(f"repair:{key}:{plate}", f"{tag}, {plate}: осмотрен, можно брать в ремонт.\n"
-                             + ("Статус заказа: " + STATUS[job["status"]] if job else "Заявки на запчасти нет — проверьте заказ.")
-                             + "\n" + event["link"], job["id"] if job else None)
+                body = (f"{plate}: осмотрен, можно брать в ремонт.\n"
+                        + ("Статус заказа: " + STATUS[job["status"]] if job else "Заявки на запчасти нет — проверьте заказ.")
+                        + "\n" + event["link"])
+                self.enqueue(f"repair:{key}:{plate}", f"🔧 {tag}, " + body, job["id"] if job else None)
+                if manager:
+                    self.dm(f"repair:{key}:{plate}", manager, "🔧 " + body, job["id"] if job else None)
         else:
             for plate in found:
                 jobs = [j for j in self.data["jobs"].values() if j["plate"] == plate]
@@ -286,14 +396,19 @@ class Parts:
                 if exact:
                     exact[-1]["sources"].append(key)
                     self.audit("bot", "additional source", exact[-1])
-                    self.publish(exact[-1], "Дополнительная информация по ДТП")
+                    self.publish(exact[-1])
                 elif jobs and (not event["date"] or any(not j["date"] for j in jobs)):
                     event["pending"].append(plate)
                 else:
                     self.new_job(plate, key, event["date"])
+        if album_id:
+            album["jobs"] = [j["id"] for j in self.data["jobs"].values() if key in j["sources"]]
+            for other in album["keys"][:-1]:  # фото альбома, пришедшие раньше подписи
+                self.data["events"][other]["plates"] = list(found)
+                for jid in album["jobs"]:
+                    self.data["jobs"][jid]["sources"].insert(0, other)
         if event["pending"]:
-            self.enqueue("unclear:" + key, f"@{self.leader}, нужно уточнить сообщение из группы ДТП: "
-                         + ", ".join(event["pending"]) + "\nОткройте в боте «Требуют уточнения».\n" + event["link"])
+            self.unclear(key, event)
         self.save()
 
     async def message(self, message, bot, app_storage=None, settings=None):
@@ -385,31 +500,140 @@ class Parts:
             await message.answer("Заявка изменена. Откройте её заново.")
             return
         step = session["step"]
+        chat = message.chat.id
         if step == "parts":
             session["parts"] = text
             session["step"] = "comment"
             self.save()
-            await message.answer("Комментарий: что осталось заказать / причина ожидания или переноса. Если пояснения не нужны — напишите «нет».")
+            await self.prompt(bot, chat, session, job)
         elif step == "comment":
-            if session["action"] in ("partial", "blocked", "repaired", "unneeded", "keep") and text.lower() == "нет":
+            if text.lower() == "нет" and session["action"] in COMMENT_REQUIRED:
                 await message.answer("Для этого действия нужна причина или пояснение.")
                 return
-            session["comment"] = "" if text.lower() == "нет" else text
-            if session["action"] in ("paid", "repaired", "unneeded"):
-                self.finish(message.from_user.id, session, job, None)
-                await message.answer("Отправлено руководителю на подтверждение.")
-            else:
-                session["step"] = "date"
-                self.save()
-                await message.answer("Когда проверить результат? Дата и время МСК, например: 27.11.2026 16:00. Пн–Пт, 09:00–17:59.")
+            await self.after_comment(bot, chat, message.from_user.id, session, job, role,
+                                     "" if text.lower() == "нет" else text)
         elif step == "date":
             try:
                 due = parse_date(text, now())
             except ValueError:
-                await message.answer("Нужна будущая дата в формате ДД.ММ.ГГГГ ЧЧ:ММ, Пн–Пт, 09:00–17:59 МСК.")
+                await message.answer("Нужна будущая дата в формате ДД.ММ.ГГГГ ЧЧ:ММ, Пн–Пт, 09:00–17:59 МСК. "
+                                     "Или выберите дату кнопкой выше.")
                 return
             self.finish(message.from_user.id, session, job, due)
-            await self.show(bot, message.chat.id, job, role)
+            await self.show(bot, chat, job, role)
+
+    async def after_comment(self, bot, chat, actor, session, job, role, comment):
+        session["comment"] = comment
+        if session["action"] in ("paid", "repaired", "unneeded"):
+            self.finish(actor, session, job, None)
+            await bot.send_message(chat, "✅ Отправлено руководителю на подтверждение.")
+            await self.show(bot, chat, job, role)
+        else:
+            session["step"] = "date"
+            self.save()
+            await self.prompt(bot, chat, session, job)
+
+    @staticmethod
+    def quick_dates():
+        """Ближайшие рабочие слоты для кнопок выбора срока."""
+        current = now()
+        result = []
+        if current.weekday() < 5 and current.hour < 15:
+            result.append(current.replace(hour=16, minute=0, second=0, microsecond=0))
+        day = current.date()
+        while len(result) < 5:
+            day += timedelta(days=1)
+            if day.weekday() < 5:
+                for hour in (10, 16):
+                    if len(result) < 5:
+                        result.append(datetime(day.year, day.month, day.day, hour, tzinfo=TZ))
+        return result
+
+    async def prompt(self, bot, chat, session, job):
+        """Сообщение текущего шага с кнопками «Назад» и «Отмена»."""
+        label = CHOICES.get(session["action"], "Комментарий / перенос срока")
+        head = f"Заявка №{job['id']} {job['plate']} — {label}\n\n"
+        step = session["step"]
+        rows = []
+        if step == "parts":
+            text = "Шаг 1. Напишите полный список запчастей одним сообщением."
+            if job["parts"]:
+                text += "\n\nСейчас указано: " + job["parts"]
+                rows.append([("Оставить текущий список", "flow:keepparts")])
+        elif step == "comment":
+            hints = {"partial": "Что осталось заказать?", "blocked": "Почему не можем заказать?",
+                     "repaired": "Подтвердите, что ремонт по этому ДТП завершён (кратко).",
+                     "unneeded": "Почему ремонт не требуется?", "keep": "Комментарий или причина переноса срока.",
+                     "disassembly": "Комментарий по разбору (если нужен).", "payment": "Комментарий по оплате (если нужен).",
+                     "paid": "Комментарий (если нужен).", "order": "Комментарий (если нужен)."}
+            text = "Комментарий. " + hints.get(session["action"], "")
+            if session["action"] not in COMMENT_REQUIRED:
+                rows.append([("Без комментария", "flow:skip")])
+        else:
+            text = "Когда проверить результат? Выберите кнопку или напишите дату: 27.11.2026 16:00 (Пн–Пт, 09:00–17:59 МСК)."
+            dates = self.quick_dates()
+            for i in range(0, len(dates), 2):
+                rows.append([(d.strftime("%a %d.%m %H:%M").replace("Mon", "Пн").replace("Tue", "Вт")
+                              .replace("Wed", "Ср").replace("Thu", "Чт").replace("Fri", "Пт"),
+                              "flow:due:" + d.strftime("%Y%m%d%H%M")) for d in dates[i:i + 2]])
+        rows.append([("⬅️ Назад", "flow:back"), ("✖️ Отмена", "flow:cancel")])
+        await bot.send_message(chat, head + text, reply_markup=keyboard(rows))
+
+    async def flow(self, bot, cb, role, args):
+        """Кнопки внутри пошагового ввода: назад, отмена, без комментария, быстрый срок."""
+        uid = str(cb.from_user.id)
+        chat = cb.message.chat.id
+        session = self.data["sessions"].get(uid)
+        if not session:
+            await cb.answer("Это действие уже завершено.", show_alert=True)
+            return
+        if session.get("step") == "plate":
+            self.data["sessions"].pop(uid, None)
+            self.save()
+            await cb.answer("Отменено.")
+            await self.menu(bot, chat, role)
+            return
+        job = self.data["jobs"][session["job"]]
+        if session["version"] != job["version"] or job["status"] in ("closed", "approval"):
+            self.data["sessions"].pop(uid, None)
+            self.save()
+            await cb.answer("Заявка изменилась. Откройте её заново.", show_alert=True)
+            return
+        await cb.answer()
+        what = args[1]
+        need_parts = session["action"] in NEED_PARTS
+        if what == "cancel":
+            self.data["sessions"].pop(uid, None)
+            self.save()
+            await bot.send_message(chat, "Действие отменено, заявка не изменилась.")
+            await self.show(bot, chat, job, role)
+        elif what == "back":
+            if session["step"] == "date":
+                session["step"] = "comment"
+            elif session["step"] == "comment" and need_parts:
+                session["step"] = "parts"
+            else:
+                self.data["sessions"].pop(uid, None)
+                self.save()
+                await self.show(bot, chat, job, role)
+                return
+            self.save()
+            await self.prompt(bot, chat, session, job)
+        elif what == "keepparts" and session["step"] == "parts":
+            session["parts"] = job["parts"]
+            session["step"] = "comment"
+            self.save()
+            await self.prompt(bot, chat, session, job)
+        elif what == "skip" and session["step"] == "comment" and session["action"] not in COMMENT_REQUIRED:
+            await self.after_comment(bot, chat, cb.from_user.id, session, job, role, "")
+        elif what == "due" and session["step"] == "date":
+            due = datetime.strptime(args[2], "%Y%m%d%H%M").replace(tzinfo=TZ)
+            if due <= now():
+                await bot.send_message(chat, "Это время уже прошло, выберите другое.")
+                await self.prompt(bot, chat, session, job)
+                return
+            self.finish(cb.from_user.id, session, job, due)
+            await self.show(bot, chat, job, role)
 
     def finish(self, actor, session, job, due):
         action = session["action"]
@@ -420,7 +644,10 @@ class Parts:
             job.update(status=job["status"] if action == "keep" else action, due=due.isoformat())
         self.data["sessions"].pop(str(actor), None)
         self.audit(actor, action, job)
-        self.publish(job, f"@{self.leader}, подтвердите закрытие" if job["status"] == "approval" else "Обновление заявки")
+        self.publish(job)
+        if job["status"] == "approval":
+            self.alert(job, f"🟡 @{self.leader}, подтвердите закрытие: {CHOICES[action]}.", dm_to=self.leader,
+                       dm_text=f"🟡 Подтвердите закрытие: {CHOICES[action]}.")
 
     async def callback(self, callback, bot):
         async with self.lock:
@@ -440,6 +667,9 @@ class Parts:
         args = cb.data.split(":")[1:]
         action = args[0]
         chat = cb.message.chat.id
+        if action == "flow":
+            await self.flow(bot, cb, role, args)
+            return
         if action == "home":
             await cb.answer()
             if args[1] == "parts":
@@ -458,20 +688,27 @@ class Parts:
             return
         if action in ("list", "overdue"):
             offset = int(args[1])
-            jobs = [j for j in self.data["jobs"].values() if self.access(j, role) and j["status"] != "closed"
+            jobs = [j for j in self.data["jobs"].values() if self.owns(j, role) and j["status"] != "closed"
                     and (action != "overdue" or datetime.fromisoformat(j["due"]) < now())]
             rows = [[(f"№{j['id']} {j['plate']} — {STATUS[j['status']]}", f"open:{j['id']}")] for j in jobs[offset:offset + 15]]
+            nav = []
+            if offset:
+                nav.append(("⬅️ Предыдущие", f"{action}:{max(offset - 15, 0)}"))
             if offset + 15 < len(jobs):
-                rows.append([("Далее", f"{action}:{offset + 15}")])
+                nav.append(("Далее ➡️", f"{action}:{offset + 15}"))
+            if nav:
+                rows.append(nav)
+            rows.append([("🏠 Меню", "home:main" if role == "leader" else "home:parts")])
             await cb.answer()
-            await bot.send_message(chat, "Заявки" if jobs else "Активных заявок нет.", reply_markup=keyboard(rows) if rows else None)
+            title = "Просроченные заявки" if action == "overdue" else ("Все заявки" if role == "leader" else "Мои заявки")
+            await bot.send_message(chat, title if jobs else "Активных заявок нет.", reply_markup=keyboard(rows))
             return
         if action == "inbox" and role == "leader":
             entries = [(key, ev) for key, ev in self.data["events"].items() if ev["pending"]]
             offset = int(args[1])
             await cb.answer()
             if offset >= len(entries):
-                await bot.send_message(chat, "Нет сообщений для уточнения.")
+                await bot.send_message(chat, "Нет сообщений для уточнения.", reply_markup=keyboard([[("🏠 Меню", "home:main")]]))
                 return
             key, event = entries[offset]
             plate = event["pending"][0]
@@ -485,6 +722,7 @@ class Parts:
             rows.append([("Не относится к контролю", f"resolve:{eid}:ignore:{token}")])
             if offset + 1 < len(entries):
                 rows.append([("Следующее сообщение", f"inbox:{offset + 1}")])
+            rows.append([("🏠 Меню", "home:main")])
             await bot.send_message(chat, f"Уточнение: {plate}\n{event['text']}\n{event['link']}", reply_markup=keyboard(rows))
             return
         if action == "resolve" and role == "leader":
@@ -534,64 +772,159 @@ class Parts:
                 job.update(due=deadline(now()).isoformat(), request=None)
             job["version"] += 1
             self.audit(cb.from_user.id, action, job)
-            self.publish(job, "Решение руководителя")
+            self.publish(job)
+            if action == "reject" and job["manager"]:
+                self.alert(job, f"↩️ @{job['manager']}, руководитель вернул заявку в работу.", dm_to=job["manager"],
+                           dm_text="↩️ Руководитель вернул заявку в работу.")
+            await bot.send_message(chat, "✅ Заявка закрыта." if action == "approve" else "↩️ Заявка возвращена в работу.")
+            await self.show(bot, chat, job, role)
         elif job["status"] == "approval":
             await cb.answer("Ожидается решение руководителя.", show_alert=True)
             return
         elif action == "reassign":
-            await bot.send_message(chat, "Выберите менеджера:", reply_markup=keyboard([
-                [(name, f"assign:{job['id']}:{job['version']}:{username}")] for username, name in MANAGERS.items()
-            ]))
+            rows = [[(name, f"assign:{job['id']}:{job['version']}:{username}")]
+                    for username, name in MANAGERS.items() if username != job["manager"]]
+            rows.append([("⬅️ Назад к заявке", f"open:{job['id']}")])
+            await bot.send_message(chat, f"Заявка №{job['id']} {job['plate']}. Кому передать?", reply_markup=keyboard(rows))
         elif action == "assign" and args[3] in MANAGERS:
+            previous = job["manager"]
             job["manager"] = args[3]
             job["version"] += 1
             self.audit(cb.from_user.id, "reassign", job)
-            self.publish(job, f"Ответственный изменён. @{self.leader}, изменение сохранено для этой заявки.")
+            self.publish(job)
+            self.alert(job, f"➡️ Заявка передана @{args[3]}" + (f" (ранее @{previous})" if previous else "") + ".",
+                       dm_to=args[3], dm_text="➡️ Вам передали заявку.")
+            await bot.send_message(chat, f"✅ Заявка №{job['id']} передана: {MANAGERS[args[3]]}.")
+            await self.show(bot, chat, job, role)
         elif action == "state" and args[3] in {*CHOICES, "keep"}:
             state = args[3]
-            need_parts = state in ("order", "partial", "payment", "paid")
-            self.data["sessions"][str(cb.from_user.id)] = {"job": job["id"], "version": job["version"],
-                "action": state, "step": "parts" if need_parts else "comment"}
+            if self.take_over(job, role, cb.from_user.id):
+                await bot.send_message(chat, f"Заявка №{job['id']} теперь закреплена за вами.")
+            need_parts = state in NEED_PARTS
+            session = {"job": job["id"], "version": job["version"], "action": state,
+                       "step": "parts" if need_parts else "comment"}
+            self.data["sessions"][str(cb.from_user.id)] = session
             self.save()
-            await bot.send_message(chat, "Напишите полный список запчастей одним сообщением." if need_parts else
-                                   "Напишите комментарий / причину. Если пояснения не нужны — «нет». /start — отмена.")
+            await self.prompt(bot, chat, session, job)
         await cb.answer()
+
+    def flush_albums(self, current):
+        """Альбом без номера ни в одной подписи — одно уточнение руководителю на весь альбом."""
+        for aid, album in list(self.data.get("albums", {}).items()):
+            at = datetime.fromisoformat(album["at"])
+            if not album["plates"] and not album["flagged"] and current - at > timedelta(seconds=20):
+                album["flagged"] = True
+                key = album["keys"][0]
+                event = self.data["events"][key]
+                event["pending"] = ["?"]
+                event["text"] = (event["text"] + f"\n(альбом: {len(album['keys'])} файлов)").strip()
+                self.unclear(key, event)
+            if current - at > timedelta(days=2):
+                del self.data["albums"][aid]
+
+    def overdue_reminders(self, current):
+        slot = "16" if current.hour >= 16 else "10" if current.hour >= 10 else None
+        for job in self.data["jobs"].values():
+            if job["status"] == "closed" or datetime.fromisoformat(job["due"]) > current:
+                continue
+            if job["status"] != "new" and not slot:
+                continue
+            if job["status"] != "new" and current.replace(hour=int(slot), minute=0, second=0, microsecond=0) < datetime.fromisoformat(job["due"]):
+                continue
+            # Первый срок (2 рабочих часа) — сразу; дальше — дважды в день, 10:00 и 16:00.
+            initial = f"late:{job['id']}:{job['version']}:first"
+            key = initial if initial not in self.data["outbox"] else (f"late:{job['id']}:{job['version']}:{current.date()}:{slot}" if slot else None)
+            if not key:
+                continue
+            due = datetime.fromisoformat(job["due"]).strftime("%d.%m %H:%M")
+            approval = job["status"] == "approval"
+            who = "" if approval else ("@" + job["manager"] if job["manager"] else "")
+            self.enqueue(key, f"⏰ Просрочено. @{self.leader} {who}\n{self.short(job)}\n"
+                              f"Статус: {STATUS[job['status']]}, срок был {due} МСК", job["id"])
+            if approval:
+                self.dm(key, self.leader, f"⏰ Ждёт вашего подтверждения с {due}.\n{self.short(job)}", job["id"])
+            elif job["manager"]:
+                self.dm(key, job["manager"], f"⏰ Просрочена ваша заявка (срок был {due}).\n{self.short(job)}\n"
+                                             "Откройте её и обновите статус или перенесите срок с причиной.", job["id"])
+            if key == initial and slot:
+                self.data["outbox"][f"late:{job['id']}:{job['version']}:{current.date()}:{slot}"] = {"sent": True}
+
+    def digest(self, current):
+        """Утренняя сводка в личку, Пн–Пт 09:30–12:00 (один раз в день)."""
+        if not ((current.hour == 9 and current.minute >= 30) or 10 <= current.hour < 12):
+            return
+        day = current.date().isoformat()
+        active = [j for j in self.data["jobs"].values() if j["status"] != "closed"]
+        for name in [*MANAGERS, self.leader]:
+            key = f"digest:{day}:{name}"
+            if "dm:" + key in self.data["outbox"]:
+                continue
+            leader = name == self.leader
+            mine = active if leader else [j for j in active if j["manager"] == name]
+            inbox = sum(1 for ev in self.data["events"].values() if ev["pending"]) if leader else 0
+            if not mine and not inbox:
+                continue
+            late = {j["id"] for j in mine if datetime.fromisoformat(j["due"]) < current}
+            text = (f"☀️ Доброе утро! {'Все заявки' if leader else 'Ваши заявки'} по запчастям: "
+                    f"{len(mine)} в работе, просрочено {len(late)}.")
+            if leader:
+                waiting = sum(1 for j in mine if j["status"] == "approval")
+                text += f"\nЖдут вашего подтверждения: {waiting}. Требуют уточнения: {inbox}."
+            order = sorted(mine, key=lambda j: (j["id"] not in late, j["due"]))[:10]
+            rows = [[[("⏰ " if j["id"] in late else "") + f"№{j['id']} {j['plate']} — {STATUS[j['status']]}",
+                      f"open:{j['id']}"]] for j in order]
+            if len(mine) > 10:
+                rows.append([["Все заявки", "list:0"]])
+            if inbox:
+                rows.append([["Требуют уточнения", "inbox:0"]])
+            self.dm(key, name, text, rows=rows)
 
     async def tick(self, bot, current=None):
         async with self.lock:
             current = current or now()
+            self.flush_albums(current)
             if self.data["target"] and working(current):
-                slot = "16" if current.hour >= 16 else "10" if current.hour >= 10 else None
-                for job in self.data["jobs"].values():
-                    if job["status"] == "closed" or datetime.fromisoformat(job["due"]) > current:
-                        continue
-                    if job["status"] != "new" and not slot:
-                        continue
-                    if job["status"] != "new" and current.replace(hour=int(slot), minute=0, second=0, microsecond=0) < datetime.fromisoformat(job["due"]):
-                        continue
-                    # Initial two-hour response deadline is escalated promptly; scheduled follow-ups twice daily.
-                    initial = f"late:{job['id']}:{job['version']}:first"
-                    key = initial if initial not in self.data["outbox"] else (f"late:{job['id']}:{job['version']}:{current.date()}:{slot}" if slot else None)
-                    if key:
-                        manager = "" if job["status"] == "approval" else ("@" + job["manager"] if job["manager"] else "")
-                        self.enqueue(key, f"Просрочено. @{self.leader} {manager}\n\n" + self.card(job), job["id"])
-                        if key == initial and slot:
-                            self.data["outbox"][f"late:{job['id']}:{job['version']}:{current.date()}:{slot}"] = {"sent": True}
+                self.overdue_reminders(current)
+                self.digest(current)
             self.save()
-            for key, item in self.data["outbox"].items():
+            for key, item in list(self.data["outbox"].items()):
+                kind = item.get("kind")
                 chat = item.get("chat") or self.data["target"]
-                if item["sent"] or not chat:
+                if item.get("sent") or not chat:
                     continue
-                if key.startswith("late:"):
-                    _, jid, version, *_ = key.split(":")
+                if key.startswith(("late:", "dm:late:")):
+                    jid, version = key.removeprefix("dm:").split(":")[1:3]
                     job = self.data["jobs"][jid]
                     if job["status"] == "closed" or job["version"] != int(version):
                         item["sent"] = True
                         self.save()
                         continue
+                job = self.data["jobs"].get(str(item["job"])) if item.get("job") else None
+                markup = keyboard(item["rows"]) if item.get("rows") else (self.link(item["job"]) if item.get("job") else None)
                 try:
-                    await bot.send_message(chat, item["text"], reply_markup=self.link(item["job"]) if item.get("job") else None)
+                    if kind == "edit":
+                        if not job.get("card"):
+                            if not self.data["outbox"].get(f"card:{job['id']}", {}).get("sent"):
+                                continue  # карточка ещё не отправлена — правка подождёт
+                            kind = "card"
+                        else:
+                            try:
+                                await bot.edit_message_text(self.render(job), chat_id=self.data["target"],
+                                                            message_id=job["card"], reply_markup=markup)
+                            except TelegramBadRequest as error:
+                                if "not modified" not in str(error).lower():
+                                    kind = "card"  # карточку удалили — публикуем заново
+                    if kind == "card":
+                        sent = await bot.send_message(self.data["target"], self.render(job), reply_markup=markup)
+                        job["card"] = getattr(sent, "message_id", None)
+                    elif kind != "edit":
+                        await bot.send_message(chat, item["text"], reply_markup=markup)
                 except TelegramAPIError:
+                    if kind == "dm":
+                        LOG.warning("Private notification %s not delivered (user has not started the bot?)", key)
+                        item["sent"] = True
+                        self.save()
+                        continue
                     LOG.exception("Procurement notification failed; retained for retry")
                     continue
                 item["sent"] = True
