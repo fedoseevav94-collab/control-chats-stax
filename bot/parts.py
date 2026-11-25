@@ -411,6 +411,20 @@ class Parts:
             self.unclear(key, event)
         self.save()
 
+    async def drop(self, message):
+        """Удалить служебную команду из группы (если у бота есть право удалять сообщения)."""
+        try:
+            await message.delete()
+        except (TelegramAPIError, AttributeError):
+            pass
+
+    async def tell_leader(self, bot, text):
+        if self.data["leader_id"]:
+            try:
+                await bot.send_message(self.data["leader_id"], text)
+            except TelegramAPIError:
+                LOG.warning("Leader private chat is not available")
+
     async def message(self, message, bot, app_storage=None, settings=None):
         async with self.lock:
             if message.chat.type == "private" and (message.text or "").startswith("/start") and app_storage:
@@ -422,24 +436,33 @@ class Parts:
         text = (message.text or "").strip()
         if message.chat.type != "private":
             if text.startswith("/parts_bind"):
+                # В группах бот молчит: ответ — руководителю в личку, саму команду убираем из чата.
+                await self.drop(message)
                 if not message.from_user or (message.from_user.username or "").lower() != self.leader:
                     return
                 self.register(message.from_user)
                 if self.role(message.from_user) != "leader":
                     return
+                title = f"«{getattr(message.chat, 'title', None) or message.chat.id}»"
                 arg = text.split()[-1]
                 if arg not in ("source", "target"):
-                    await message.answer("Укажите /parts_bind source в ДТП или /parts_bind target в закупе.")
+                    await self.tell_leader(bot, f"Группа {title}: укажите /parts_bind source (группа ДТП) "
+                                                "или /parts_bind target (группа заказа запчастей).")
                     return
                 other = "target" if arg == "source" else "source"
                 if message.chat.id == self.data[other]:
-                    await message.answer("Для ДТП и закупа нужны разные группы.")
+                    await self.tell_leader(bot, f"Группа {title} уже закреплена как "
+                                                + ("группа заказа" if other == "target" else "группа ДТП")
+                                                + ". Для ДТП и заказа нужны разные группы.")
                     return
                 self.data[arg] = message.chat.id
                 self.audit(message.from_user.id, "bind " + arg)
                 self.save()
-                await message.answer("Группа закреплена: " + ("ДТП" if arg == "source" else "контроль закупа"))
+                await self.tell_leader(bot, f"✅ Группа {title} закреплена: "
+                                            + ("источник ДТП" if arg == "source" else "заказ запчастей") + ".")
                 return
+            if text.startswith("/") and message.chat.id in (self.data["source"], self.data["target"]):
+                return  # служебные команды в рабочих группах игнорируем молча
             if message.chat.id == self.data["source"]:
                 if message.from_user and not message.from_user.is_bot:
                     await self.ingest(message)

@@ -299,3 +299,29 @@ def test_private_notifications_and_digest(tmp_path):
         assert p.data["outbox"]["dm:x"]["sent"]  # личка недоступна — не повторяем бесконечно
         p.db.close()
     asyncio.run(run())
+
+
+def test_group_stays_silent_on_service_commands(tmp_path):
+    async def run():
+        p, bot = make(tmp_path), make_bot()
+        p.data["source"] = p.data["target"] = None
+        sent_in_group = AsyncMock()
+
+        def group_msg(text, uid=1, name="fedos_av", chat=-10020):
+            return NS(chat=NS(id=chat, type="supergroup", title="ДТП"), message_id=1, text=text,
+                      from_user=user(uid, name), answer=sent_in_group, delete=AsyncMock())
+
+        msg = group_msg("/parts_bind")
+        await p.message(msg, bot)
+        msg.delete.assert_awaited()
+        assert p.data["source"] is None
+        await p.message(group_msg("/parts_bind source"), bot)
+        assert p.data["source"] == -10020
+        await p.message(group_msg("/chatid"), bot)  # в рабочей группе — тишина
+        await p.message(group_msg("/parts_bind target", uid=3, name="pagorodu", chat=-10), bot)
+        assert p.data["target"] is None  # не руководитель — игнор
+        sent_in_group.assert_not_awaited()
+        assert all(c.args[0] == 1 for c in bot.send_message.call_args_list)  # все ответы — руководителю в личку
+        assert any("закреплена" in c.args[1] for c in bot.send_message.call_args_list)
+        p.db.close()
+    asyncio.run(run())
