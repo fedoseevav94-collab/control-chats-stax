@@ -111,6 +111,8 @@ class Parts:
         self.lock = asyncio.Lock()
         self.username = ""
         self.defer_save = False
+        self.app_storage = None
+        self.settings = None
         self.save()
 
     def save(self):
@@ -202,10 +204,44 @@ class Parts:
         await bot.send_message(chat, text, reply_markup=keyboard(rows))
 
     async def menu(self, bot, chat, role):
+        if role == "leader":
+            # Руководитель управляет двумя разделами: запчасти и контроль чатов.
+            rows = [[("🚗 Контроль запчастей", "home:parts")], [("💬 Контроль чатов", "home:chats")]]
+            await bot.send_message(chat, "Главное меню. Выберите раздел:", reply_markup=keyboard(rows))
+            return
+        await self.parts_menu(bot, chat, role)
+
+    async def parts_menu(self, bot, chat, role):
         rows = [[("Все заявки" if role == "leader" else "Мои заявки", "list:0")], [("Просроченные", "overdue:0")]]
         if role == "leader":
             rows.append([("Требуют уточнения", "inbox:0")])
-        await bot.send_message(chat, "Контроль запчастей", reply_markup=keyboard(rows))
+            rows.append([("⬅️ Главное меню", "home:main")])
+        await bot.send_message(chat, "🚗 Контроль запчастей", reply_markup=keyboard(rows))
+
+    async def chats_menu(self, bot, chat):
+        rows = [[("📊 Статистика", "chats:stats")], [("💸 Штрафы за месяц", "chats:fines")],
+                [("⚙️ Настройки", "chats:settings")], [("⬅️ Главное меню", "home:main")]]
+        await bot.send_message(chat, "💬 Контроль чатов\n\nНапоминания об ответах работают в рабочих чатах "
+                               "автоматически. Здесь — отчёты руководителя.\n"
+                               "Статистика сотрудника: /stats @username, штрафы за месяц: /fines 2026-05.",
+                               reply_markup=keyboard(rows))
+
+    async def run_chat_report(self, bot, cb, name):
+        """Вызывает существующие отчёты контроля чатов (/stats, /settings, /fines) из кнопки."""
+        from types import SimpleNamespace
+        from bot import main as chats
+        handler = {"stats": chats.stats_command, "settings": chats.settings_command, "fines": chats.fines_command}[name]
+        chat = cb.message.chat.id
+
+        async def answer(text, **kwargs):
+            return await bot.send_message(chat, text, **kwargs)
+
+        async def answer_document(document, **kwargs):
+            return await bot.send_document(chat, document, **kwargs)
+
+        shim = SimpleNamespace(from_user=cb.from_user, chat=cb.message.chat, text="/" + name,
+                               answer=answer, answer_document=answer_document)
+        await handler(shim, self.app_storage, self.settings)
 
     async def ingest(self, message):
         before = copy.deepcopy(self.data)
@@ -404,6 +440,22 @@ class Parts:
         args = cb.data.split(":")[1:]
         action = args[0]
         chat = cb.message.chat.id
+        if action == "home":
+            await cb.answer()
+            if args[1] == "parts":
+                await self.parts_menu(bot, chat, role)
+            elif args[1] == "chats" and role == "leader":
+                await self.chats_menu(bot, chat)
+            else:
+                await self.menu(bot, chat, role)
+            return
+        if action == "chats":
+            if role != "leader" or self.app_storage is None:
+                await cb.answer("Нет доступа.", show_alert=True)
+                return
+            await cb.answer()
+            await self.run_chat_report(bot, cb, args[1])
+            return
         if action in ("list", "overdue"):
             offset = int(args[1])
             jobs = [j for j in self.data["jobs"].values() if self.access(j, role) and j["status"] != "closed"
@@ -554,6 +606,8 @@ async def install(dispatcher, bot, settings, app_storage):
     fleet = json.loads(fleet_path.read_text())
     service = Parts(str(settings.database_path) + ".parts", fleet, settings.leader_username)
     service.username = (await bot.get_me()).username
+    service.app_storage = app_storage
+    service.settings = settings
     for name in [settings.leader_username, *MANAGERS]:
         user = await app_storage.get_user_by_username(name)
         if user:
