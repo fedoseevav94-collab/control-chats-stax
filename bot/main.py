@@ -5,6 +5,7 @@ import csv
 import io
 import html
 import logging
+import os
 import re
 from datetime import date, datetime, time, timedelta, timezone
 
@@ -133,15 +134,14 @@ def commands_help_text(settings: Settings, user: User | None) -> str:
 
 
 async def setup_bot_commands(bot: Bot) -> None:
+    commands = [BotCommand(command="start", description="Активировать личные сообщения")]
+    if os.getenv("PARTS_ENABLED", "false").lower() != "true":
+        commands += [BotCommand(command=c, description=d) for c, d in [
+            ("help", "Показать команды бота"), ("chatid", "Показать ID текущего чата"),
+            ("stats", "Статистика для руководителя"), ("settings", "Настройки для руководителя"),
+            ("fines", "Отчёт по штрафам для руководителя")]]
     await bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Активировать личные сообщения"),
-            BotCommand(command="help", description="Показать команды бота"),
-            BotCommand(command="chatid", description="Показать ID текущего чата"),
-            BotCommand(command="stats", description="Статистика для руководителя"),
-            BotCommand(command="settings", description="Настройки для руководителя"),
-            BotCommand(command="fines", description="Отчёт по штрафам для руководителя"),
-        ]
+        commands
     )
 
 
@@ -3331,6 +3331,8 @@ async def main() -> None:
     bot = Bot(settings.bot_token)
     await setup_bot_commands(bot)
     dispatcher = Dispatcher(app_storage=storage, settings=settings)
+    from bot.parts import install
+    parts_service, parts_task = await install(dispatcher, bot, settings, storage)
     detach_router_from_dispatcher()
     dispatcher.include_router(router)
 
@@ -3340,6 +3342,14 @@ async def main() -> None:
         await dispatcher.start_polling(bot, allowed_updates=ALLOWED_UPDATES)
     finally:
         scheduler_task.cancel()
+        if parts_task:
+            parts_task.cancel()
+            try:
+                await parts_task
+            except asyncio.CancelledError:
+                pass
+        if parts_service:
+            parts_service.db.close()
         detach_router_from_dispatcher()
         await bot.session.close()
         await storage.close()
