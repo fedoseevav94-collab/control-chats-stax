@@ -31,6 +31,7 @@ CHOICES = {"order": "Нужно заказать", "partial": "Заказано 
            "repaired": "Уже отремонтирована", "unneeded": "Ремонт не требуется"}
 NEED_PARTS = ("order", "partial", "payment", "paid")
 COMMENT_REQUIRED = ("partial", "blocked", "repaired", "unneeded", "keep")
+MEDIA = ("document", "photo", "video", "voice", "video_note", "audio", "animation")
 TRANS = str.maketrans("ABEKMHOPCTYX", "АВЕКМНОРСТУХ")
 
 
@@ -42,15 +43,34 @@ def normalize(value):
     return re.sub(r"[\s_-]+", "", value.upper()).translate(TRANS)
 
 
+SEP = r"[\s_\-./|\\]*"  # разделители внутри номера: пробел, дефис, подчёркивание, точка, слэш, черта
+PLATE = re.compile(
+    r"(?<![А-ЯA-Z0-9])([АВЕКМНОРСТУХ0])" + SEP + r"([\dО]{3})" + SEP + r"([АВЕКМНОРСТУХ0]{2})"
+    r"(?:" + SEP + r"(\d{2,3})(?!\d)|(?![А-ЯA-Z\d]))")
+
+
 def plates(text, fleet):
+    """Госномера из текста. Латиница и кириллица, любой регистр, разделители внутри номера,
+    0 вместо О (и наоборот) — если такой номер есть в справочнике, номер без региона — если он
+    однозначно находится в справочнике."""
     text = text.upper().translate(TRANS)
-    sep = r"[\s_-]*"  # допускаем пробелы, дефисы и подчёркивания внутри номера: В326СВ-761, В326СВ_761.zip
-    found = re.findall(r"(?<![А-ЯA-Z0-9])[АВЕКМНОРСТУХ]" + sep + r"\d{3}" + sep + r"[АВЕКМНОРСТУХ]{2}"
-                       + sep + r"\d{2,3}(?!\d)", text)
-    result = {normalize(p) for p in found}
-    # Exact known unusual identifiers, e.g. ЕС53674 / ЕС 53674. Never guess their format.
+    result = set()
+    for letter, digits, letters, region in PLATE.findall(text):
+        fixed = (letter.replace("0", "О") + digits.replace("О", "0") + letters.replace("0", "О"))
+        guessed = fixed != letter + digits + letters  # пришлось исправить 0/О
+        if region:
+            plate = fixed + region
+            if not guessed or plate in fleet:
+                result.add(plate)
+        else:
+            matches = [p for p in fleet if p.startswith(fixed)]
+            if len(matches) == 1:
+                result.add(matches[0])
+    # Нестандартные номера из справочника (например ЕС53674 / ЕС 53674) — только точное совпадение.
     for plate in fleet:
-        pattern = sep.join(re.escape(ch) for ch in plate)
+        if PLATE.fullmatch(plate):
+            continue
+        pattern = SEP.join(re.escape(ch) for ch in plate)
         if re.search(r"(?<![А-ЯA-Z0-9])" + pattern + r"(?![А-ЯA-Z0-9])", text):
             result.add(plate)
     return sorted(result)
@@ -78,38 +98,66 @@ def parse_date(text, current):
     return value
 
 
-DATE = r"(\d{1,2})[./-](\d{1,2})"
+MONTHS = {"янв": 1, "фев": 2, "мар": 3, "апр": 4, "мая": 5, "май": 5, "июн": 6, "июл": 7,
+          "авг": 8, "сен": 9, "окт": 10, "ноя": 11, "дек": 12}
+ACCIDENT = r"(?:дтп|д\.\s*т\.\s*п\.?|авари\w*|столкнов\w*|происшеств\w*)"
+NUM_DATE = r"(\d{1,2})[.,/\-\s](\d{1,2})(?:[.,/\-\s](\d{4}|\d{2}))?(?!\d)"
+WORD_DATE = r"(\d{1,2})\s*(" + "|".join(MONTHS) + r")[а-я]*\.?(?:\s*(\d{4}))?"
+RELATIVE = {"позавчера": 2, "вчера": 1, "сегодня": 0}
 
 
-def accident_date(text, today=None):
-    """Дата ДТП: «ДТП от 24.11.2026», «ДТП 24.11», «дтп 24.11.26», «ДТП_24-11-2026.zip»,
-    а если слова «ДТП» рядом нет — первая полная дата в тексте (24.11.2026 / 24.11.26)."""
-    today = today or now().date()
-    match = re.search(r"дтп[\W_]{0,10}(?:от[\W_]{0,3})?" + DATE + r"(?:[./-](\d{4}|\d{2}))?(?!\d)", text, re.I)
-    if not match:
-        match = re.search(r"(?<![\d.])" + DATE + r"[./-](\d{4}|\d{2})(?![\d])", text)
-    if not match:
-        return None
-    day, month, year = int(match[1]), int(match[2]), match[3]
+def _make_date(day, month, year, today):
     try:
-        value = date(int(year) + (2000 if len(year) == 2 else 0) if year else today.year, month, day)
+        value = date(int(year) + (2000 if len(year) == 2 else 0) if year else today.year, int(month), int(day))
     except ValueError:
         return None
-    if not year and value > today:
+    if not year and value > today + timedelta(days=1):
         try:
             value = value.replace(year=value.year - 1)
         except ValueError:
             return None
     if value > today + timedelta(days=1) or value < today - timedelta(days=730):
         return None
-    return value.isoformat()
+    return value
+
+
+def accident_date(text, today=None):
+    """Дата ДТП. Понимает «ДТП от 24.11.2026», «ДТП 24.11», «24,11», «24 11 2026», «24/11/26»,
+    «24 ноября», «ДТП вчера», дату перед словом ДТП и дату в имени архива."""
+    today = today or now().date()
+    low = text.lower().replace("ё", "е")
+    near = r"[\W_]{0,3}(?:от|был[оа]?|произошл[оа]?)?[\W_]{0,3}"
+    # (шаблон, вид, только недавняя дата) — от самых надёжных к менее надёжным
+    candidates = [
+        (ACCIDENT + near + r"(позавчера|вчера|сегодня)", "rel", False),
+        (ACCIDENT + near + WORD_DATE, "word", False),
+        (ACCIDENT + near + NUM_DATE, "num", False),
+        (WORD_DATE + r"[^\n]{0,15}?" + ACCIDENT, "word", False),
+        (NUM_DATE + r"[^\n\d]{0,15}?" + ACCIDENT, "num", False),
+        (r"(?<![\d.])(\d{1,2})[./\-](\d{1,2})[./\-](\d{4}|\d{2})(?!\d)", "num", False),  # полная дата где угодно
+        (r"(?<!\d)" + WORD_DATE, "word", False),
+        (r"(?<![\d.,/])(\d{1,2})[./](\d{1,2})(?![\d.,/])()", "num", True),  # «24.11» где угодно — только недавняя
+    ]
+    for pattern, kind, recent_only in candidates:
+        for match in re.finditer(pattern, low):
+            if kind == "rel":
+                return (today - timedelta(days=RELATIVE[match[1]])).isoformat()
+            day, month, year = match.groups()[-3:]
+            value = _make_date(day, MONTHS[month] if kind == "word" else month, year, today)
+            if value and (not recent_only or value >= today - timedelta(days=60)):
+                return value.isoformat()
+    return None
 
 
 def repair_notice(text):
+    """«Можно в ремонт» во всех частых формулировках; вопросы и отрицания — нет."""
     value = text.lower().replace("ё", "е")
-    if "?" in value or re.search(r"(?:нельзя|не\s+можно|не\s+разрешено|не\s+осмотрен)", value):
+    if "?" in value or re.search(r"нельзя|не\s+можно|не\s+разреш|не\s+осмотр|запрещ|пока\s+не\b|еще\s+не\b", value):
         return False
-    return bool(re.search(r"можно\s+(?:брать\s+)?в\s+ремонт|разрешен[оа]?\s+.*ремонт", value))
+    return bool(re.search(
+        r"можно\s+(?:\w+\s+){0,2}в\s+ремонт|в\s+ремонт\s+(?:\w+\s+)?можно|можно\s+ремонтир"
+        r"|разреш\w*\s+(?:\w+\s+){0,2}ремонт|осмотр\w*\s+(?:\w+\s+){0,2}(?:пройден|прошл|закончен|заверш|состоял)"
+        r"|страхов\w*\s+(?:\w+\s+){0,2}осмотрел", value))
 
 
 def keyboard(rows):
@@ -347,7 +395,8 @@ class Parts:
         key = f"{message.chat.id}:{message.message_id}"
         if key in self.data["events"]:
             return
-        text = (message.text or message.caption or "") + "\n" + (message.document.file_name or "" if message.document else "")
+        files = [getattr(getattr(message, kind, None), "file_name", None) for kind in ("document", "video", "audio")]
+        text = (message.text or message.caption or "") + "\n" + "\n".join(f for f in files if f)
         found = plates(text, self.fleet)
         if not found and message.reply_to_message:
             ref = f"{message.chat.id}:{message.reply_to_message.message_id}"
@@ -375,7 +424,7 @@ class Parts:
                 return  # номер в альбоме уже обработан
             album["plates"], album["date"] = found, event["date"]
         if not found:
-            if message.document or message.photo or re.search(r"дтп|авар|осмотр|ремонт", text, re.I):
+            if any(getattr(message, kind, None) for kind in MEDIA) or re.search(r"дтп|авар|осмотр|ремонт|страхов", text, re.I):
                 event["pending"] = ["?"]
         elif repair_notice(text):
             for plate in found:
@@ -410,6 +459,20 @@ class Parts:
         if event["pending"]:
             self.unclear(key, event)
         self.save()
+
+    async def edited(self, message, bot=None, **_):
+        """Исправленное сообщение в группе ДТП: если раньше номер не нашли — разбираем заново."""
+        async with self.lock:
+            if message.chat.id != self.data["source"] or message.chat.id is None:
+                raise SkipHandler
+            key = f"{message.chat.id}:{message.message_id}"
+            event = self.data["events"].get(key)
+            if event and event["plates"]:
+                return  # уже обработано — правка не создаёт дублей
+            if event:
+                del self.data["events"][key]
+                self.data["outbox"].get("unclear:" + key, {})["sent"] = True
+            await self.ingest(message)
 
     async def drop(self, message):
         """Удалить служебную команду из группы (если у бота есть право удалять сообщения)."""
@@ -464,7 +527,8 @@ class Parts:
             if text.startswith("/") and message.chat.id in (self.data["source"], self.data["target"]):
                 return  # служебные команды в рабочих группах игнорируем молча
             if message.chat.id == self.data["source"]:
-                if message.from_user and not message.from_user.is_bot:
+                # Анонимный админ пишет от имени группы (from_user — служебный бот, есть sender_chat) — тоже читаем.
+                if not message.from_user or not message.from_user.is_bot or getattr(message, "sender_chat", None):
                     await self.ingest(message)
                 return
             if message.chat.id == self.data["target"]:
@@ -983,6 +1047,7 @@ async def install(dispatcher, bot, settings, app_storage):
         await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=uid))
     router = Router(name="parts")
     router.message.register(service.message)
+    router.edited_message.register(service.edited)
     router.callback_query.register(service.callback, F.data.startswith("parts:"))
     dispatcher.include_router(router)
 

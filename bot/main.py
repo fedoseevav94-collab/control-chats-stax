@@ -39,7 +39,7 @@ from bot.worktime import add_working_minutes, is_work_time, next_work_time
 
 logger = logging.getLogger(__name__)
 router = Router()
-ALLOWED_UPDATES = ["message", "callback_query", "message_reaction"]
+ALLOWED_UPDATES = ["message", "edited_message", "callback_query", "message_reaction"]
 
 UNCLEAR_RESPONSE_PATTERNS = (
     r"^ок(?:ей)?[.!]?$",

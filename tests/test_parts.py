@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import User
 
-from bot.parts import Parts, TZ, accident_date, deadline, parse_date, plates, repair_notice
+from bot.parts import Parts, TZ, accident_date, deadline, normalize, parse_date, plates, repair_notice
 
 
 def make(tmp_path):
@@ -323,5 +323,57 @@ def test_group_stays_silent_on_service_commands(tmp_path):
         sent_in_group.assert_not_awaited()
         assert all(c.args[0] == 1 for c in bot.send_message.call_args_list)  # все ответы — руководителю в личку
         assert any("закреплена" in c.args[1] for c in bot.send_message.call_args_list)
+        p.db.close()
+    asyncio.run(run())
+
+
+def test_plate_formats():
+    fleet = {normalize(p): {} for p in ["В326СВ761", "В156ОХ172", "ЕС53674", "В776НВ172"]}
+    for text in ["В326СВ/761", "В326СВ|761", "В326СВ.761", "в326св761", "B326CB761", "В 326 СВ 761 RUS",
+                 "в326св", "Соната В326СВ без региона", "#В326СВ761"]:
+        assert plates(text, fleet) == ["В326СВ761"], text
+    assert plates("B1560X172", fleet) == ["В156ОХ172"]  # ноль вместо буквы О — только если номер есть в справочнике
+    assert plates("ЕС 53674", fleet) == ["ЕС53674"]
+    assert plates("тел 8 911 652 42 52, ОСАГО ХХХ 1127112791", fleet) == []
+    assert plates("А999АА", fleet) == []  # без региона и нет в справочнике — не угадываем
+
+
+def test_date_and_repair_formats():
+    from datetime import date
+    today = date(2026, 11, 25)
+    for text, expected in [("ДТП 25 ноября", "2026-11-25"), ("ДТП 24 нояб.", "2026-11-24"), ("ДТП 24,11", "2026-11-24"),
+                           ("ДТП 24 11 2026", "2026-11-24"), ("24.11 было ДТП", "2026-11-24"), ("ДТП вчера", "2026-11-24"),
+                           ("авария 24.11", "2026-11-24"), ("ДТП в 10:30, 23.11", "2026-11-23")]:
+        assert accident_date(text, today) == expected, text
+    for text in ["ДТП 10 30", "Долг 12 263 ₽ до 30.12", "оплатить до 01.12", "тел 8 911 652 42 52"]:
+        assert accident_date(text, today) is None, text
+    for text in ["Можно ставить в ремонт", "можно ремонтировать", "осмотр пройден", "разрешили ремонт", "в ремонт можно"]:
+        assert repair_notice(text), text
+    for text in ["можно в ремонт?", "нельзя в ремонт", "пока не осмотрели, ремонт не начинать"]:
+        assert not repair_notice(text), text
+
+
+def test_voice_anonymous_admin_and_edited_message(tmp_path):
+    async def run():
+        p, bot = make(tmp_path), make_bot()
+        voice = NS(chat=NS(id=-10020, type="supergroup"), message_id=40, text=None, caption=None, document=None,
+                   photo=None, voice=object(), reply_to_message=None, media_group_id=None)
+        await p.ingest(voice)
+        assert p.data["events"]["-10020:40"]["pending"] == ["?"]  # голосовое без номера — на уточнение, не теряется
+        anon = NS(chat=NS(id=-10020, type="supergroup"), message_id=41, text="ДТП 24.11 В326СВ761", caption=None,
+                  document=None, photo=None, reply_to_message=None, media_group_id=None,
+                  from_user=User(id=1087968824, is_bot=True, first_name="Group", username="GroupAnonymousBot"),
+                  sender_chat=NS(id=-10020))
+        await p.message(anon, bot)
+        assert len(p.data["jobs"]) == 1  # сообщение анонимного админа обработано
+        first = NS(chat=NS(id=-10020, type="supergroup"), message_id=42, text="ДТП, фото позже", caption=None,
+                   document=None, photo=None, reply_to_message=None, media_group_id=None)
+        await p.ingest(first)
+        assert p.data["events"]["-10020:42"]["pending"] == ["?"]
+        first.text = "ДТП 23.11 В776НВ172"  # автор исправил сообщение
+        await p.edited(first, bot)
+        assert len(p.data["jobs"]) == 2 and not p.data["events"]["-10020:42"]["pending"]
+        await p.edited(first, bot)  # повторная правка — без дублей
+        assert len(p.data["jobs"]) == 2
         p.db.close()
     asyncio.run(run())
