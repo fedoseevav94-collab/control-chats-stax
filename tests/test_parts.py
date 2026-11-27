@@ -3,7 +3,7 @@ from datetime import datetime
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramMigrateToChat
 from aiogram.types import User
 
 from bot.parts import Parts, TZ, accident_date, deadline, normalize, parse_date, plates, repair_notice
@@ -391,5 +391,33 @@ def test_legacy_approval_closed_and_not_in_manager_digest(tmp_path):
         assert p.data["jobs"]["1"]["status"] == "closed"
         await p.tick(bot, datetime(2026, 11, 27, 9, 40, tzinfo=TZ))
         assert not any("Доброе утро" in c.args[1] for c in bot.send_message.call_args_list)  # нечего делать — нет сводки
+        p.db.close()
+    asyncio.run(run())
+
+
+def test_group_migrated_to_supergroup(tmp_path):
+    async def run():
+        p, bot = make(tmp_path), make_bot()
+        p.data["target"] = -555
+        sent = []
+
+        async def send(chat, text, **kwargs):
+            if chat == -555:
+                raise TelegramMigrateToChat(method=None, message="migrated", migrate_to_chat_id=-100777)
+            sent.append(chat)
+            return NS(message_id=1)
+
+        bot.send_message = send
+        p.new_job("В326СВ761", "source")
+        await p.tick(bot, datetime(2026, 11, 25, 9, 0, tzinfo=TZ))
+        assert p.data["target"] == -100777  # привязка переехала на новый ID
+        await p.tick(bot, datetime(2026, 11, 25, 9, 1, tzinfo=TZ))
+        assert -100777 in sent and p.data["outbox"]["card:1"]["sent"]
+        # служебное сообщение Telegram о переезде группы тоже переносит привязку
+        p.data["source"] = -20
+        moved = NS(chat=NS(id=-20, type="group"), migrate_to_chat_id=-100888, text=None, caption=None,
+                   from_user=None, message_id=5)
+        await p.message(moved, bot)
+        assert p.data["source"] == -100888
         p.db.close()
     asyncio.run(run())

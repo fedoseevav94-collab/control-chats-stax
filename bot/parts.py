@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramMigrateToChat
 from aiogram.types import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup
 
 LOG = logging.getLogger(__name__)
@@ -485,6 +485,19 @@ class Parts:
                 self.data["outbox"].get("unclear:" + key, {})["sent"] = True
             await self.ingest(message)
 
+    def migrate(self, old, new):
+        """Группу перевели в супергруппу — у неё новый ID. Переносим привязку автоматически."""
+        changed = False
+        for role in ("source", "target"):
+            if old is not None and self.data[role] == old:
+                self.data[role] = new
+                changed = True
+        if changed:
+            LOG.warning("Procurement group %s migrated to %s", old, new)
+            self.audit(None, f"group migrated {old} -> {new}")
+            self.save()
+        return changed
+
     async def drop(self, message):
         """Удалить служебную команду из группы (если у бота есть право удалять сообщения)."""
         try:
@@ -509,6 +522,11 @@ class Parts:
     async def _message(self, message, bot):
         text = (message.text or "").strip()
         if message.chat.type != "private":
+            moved = getattr(message, "migrate_to_chat_id", None)
+            if moved and self.migrate(message.chat.id, moved):
+                return
+            if getattr(message, "migrate_from_chat_id", None) and self.migrate(message.migrate_from_chat_id, message.chat.id):
+                return
             if text.startswith("/parts_bind"):
                 # В группах бот молчит: ответ — руководителю в личку, саму команду убираем из чата.
                 await self.drop(message)
@@ -1007,6 +1025,10 @@ class Parts:
                         self.save()
                         continue
                 job = self.data["jobs"].get(str(item["job"])) if item.get("job") else None
+                if key.startswith("alert:") and job and job["status"] == "closed":
+                    item["sent"] = True  # сигнал по уже закрытой заявке не нужен
+                    self.save()
+                    continue
                 markup = keyboard(item["rows"]) if item.get("rows") else (self.link(item["job"]) if item.get("job") else None)
                 try:
                     if kind == "edit":
@@ -1026,6 +1048,11 @@ class Parts:
                         job["card"] = getattr(sent, "message_id", None)
                     elif kind != "edit":
                         await bot.send_message(chat, item["text"], reply_markup=markup)
+                except TelegramMigrateToChat as error:
+                    target = self.data["target"]
+                    if not self.migrate(chat if kind not in ("card", "edit") else target, error.migrate_to_chat_id):
+                        LOG.exception("Procurement chat migrated, binding not found")
+                    continue  # отправим на новый ID на следующем проходе
                 except TelegramAPIError:
                     if kind == "dm":
                         LOG.warning("Private notification %s not delivered (user has not started the bot?)", key)
