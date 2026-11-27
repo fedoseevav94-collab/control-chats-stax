@@ -86,13 +86,14 @@ def test_acl_closure_and_stale_buttons(tmp_path):
         session = p.data["sessions"]["2"]
         session.update(parts="Бампер", comment="Оплата подтверждена")
         p.finish(2, session, j, None)
-        assert j["status"] == "approval"
-        await p.callback(callback(2, "approve:1:1"), bot)
-        assert j["status"] == "approval"
-        await p.callback(callback(1, "approve:1:1"), bot)
+        assert j["status"] == "closed" and j["request"] == "paid"  # закрывается сразу, без подтверждения
+        assert any(k.startswith("dm:closed:1") for k in p.data["outbox"])  # руководителю — уведомление
+        await p.callback(callback(2, "reopen:1:1"), bot)  # менеджер вернуть не может
         assert j["status"] == "closed"
+        await p.callback(callback(1, "reopen:1:1"), bot)  # руководитель возвращает в работу
+        assert j["status"] == "new" and j["version"] == 2
         count = len(p.data["history"])
-        await p.callback(callback(1, "approve:1:1"), bot)
+        await p.callback(callback(1, "reopen:1:1"), bot)  # устаревшая кнопка ничего не меняет
         assert len(p.data["history"]) == count
         p.db.close()
     asyncio.run(run())
@@ -375,5 +376,20 @@ def test_voice_anonymous_admin_and_edited_message(tmp_path):
         assert len(p.data["jobs"]) == 2 and not p.data["events"]["-10020:42"]["pending"]
         await p.edited(first, bot)  # повторная правка — без дублей
         assert len(p.data["jobs"]) == 2
+        p.db.close()
+    asyncio.run(run())
+
+
+def test_legacy_approval_closed_and_not_in_manager_digest(tmp_path):
+    async def run():
+        p, bot = make(tmp_path), make_bot()
+        j = p.new_job("В847ХУ172", "source", )
+        j.update(manager="lalalas19", status="approval", request="paid")
+        p.save()
+        p.db.close()
+        p = make(tmp_path)  # перезапуск бота
+        assert p.data["jobs"]["1"]["status"] == "closed"
+        await p.tick(bot, datetime(2026, 11, 27, 9, 40, tzinfo=TZ))
+        assert not any("Доброе утро" in c.args[1] for c in bot.send_message.call_args_list)  # нечего делать — нет сводки
         p.db.close()
     asyncio.run(run())

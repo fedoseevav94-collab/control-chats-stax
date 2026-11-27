@@ -29,6 +29,7 @@ STATUS = {
 CHOICES = {"order": "Нужно заказать", "partial": "Заказано частично", "payment": "Всё заказано — ждём оплату",
            "paid": "Всё заказано и оплачено", "disassembly": "Ждём разбор", "blocked": "Не можем заказать",
            "repaired": "Уже отремонтирована", "unneeded": "Ремонт не требуется"}
+CLOSING = ("paid", "repaired", "unneeded")  # закрывают заявку сразу; руководитель может вернуть в работу
 NEED_PARTS = ("order", "partial", "payment", "paid")
 COMMENT_REQUIRED = ("partial", "blocked", "repaired", "unneeded", "keep")
 MEDIA = ("document", "photo", "video", "voice", "video_note", "audio", "animation")
@@ -183,6 +184,11 @@ class Parts:
         self.defer_save = False
         self.app_storage = None
         self.settings = None
+        for job in self.data["jobs"].values():  # прежнее правило «ждёт подтверждения» отменено — закрываем
+            if job["status"] == "approval":
+                job.update(status="closed", closed_at=now().isoformat(), version=job["version"] + 1)
+                self.audit(None, "auto-close (approval removed)", job)
+                self.publish(job)
         self.save()
 
     def save(self):
@@ -270,7 +276,9 @@ class Parts:
         manager = "@" + job["manager"] if job["manager"] else "не определён"
         due = datetime.fromisoformat(job["due"]).strftime("%d.%m.%Y %H:%M")
         lines = [f"Заявка №{job['id']}", f"{job['plate']} — {job['model']}", f"Менеджер: {manager}",
-                 f"Статус: {STATUS[job['status']]}", f"Контроль: {due} МСК",
+                 f"Статус: {STATUS[job['status']]}",
+                 (f"Закрыта: {datetime.fromisoformat(job['closed_at']).strftime('%d.%m.%Y %H:%M')} МСК"
+                  if job["status"] == "closed" and job.get("closed_at") else f"Контроль: {due} МСК"),
                  f"Запчасти: {job['parts'] or 'список ещё не указан'}", f"Комментарий: {job['comment'] or '—'}"]
         if job.get("request"):
             lines.append("Основание закрытия: " + CHOICES.get(job["request"], job["request"]))
@@ -325,7 +333,10 @@ class Parts:
         if job["status"] == "approval":
             if role == "leader":
                 rows = [[("Подтвердить закрытие", f"approve:{jid}:{version}"), ("Вернуть в работу", f"reject:{jid}:{version}")]]
-        elif job["status"] != "closed":
+        elif job["status"] == "closed":
+            if role == "leader":
+                rows = [[("↩️ Вернуть в работу", f"reopen:{jid}:{version}")]]
+        else:
             rows = [[(label, f"state:{jid}:{version}:{code}")] for code, label in CHOICES.items()]
             rows += [[("Машина не моя", f"reassign:{jid}:{version}")], [("Комментарий / перенос срока", f"state:{jid}:{version}:keep")]]
         rows.append([("📋 К списку заявок", "list:0"), ("🏠 Меню", "home:main")])
@@ -613,7 +624,7 @@ class Parts:
         session["comment"] = comment
         if session["action"] in ("paid", "repaired", "unneeded"):
             self.finish(actor, session, job, None)
-            await bot.send_message(chat, "✅ Отправлено руководителю на подтверждение.")
+            await bot.send_message(chat, "✅ Заявка закрыта. Руководитель получил уведомление.")
             await self.show(bot, chat, job, role)
         else:
             session["step"] = "date"
@@ -725,16 +736,21 @@ class Parts:
     def finish(self, actor, session, job, due):
         action = session["action"]
         job.update(parts=session.get("parts", job["parts"]), comment=session["comment"], version=job["version"] + 1)
-        if action in ("paid", "repaired", "unneeded"):
-            job.update(status="approval", request=action, due=deadline(now()).isoformat())
+        if action in CLOSING:
+            job.update(status="closed", request=action, closed_at=now().isoformat())
         else:
-            job.update(status=job["status"] if action == "keep" else action, due=due.isoformat())
+            job.update(status=job["status"] if action == "keep" else action, due=due.isoformat(), request=None)
         self.data["sessions"].pop(str(actor), None)
         self.audit(actor, action, job)
         self.publish(job)
-        if job["status"] == "approval":
-            self.alert(job, f"🟡 @{self.leader}, подтвердите закрытие: {CHOICES[action]}.", dm_to=self.leader,
-                       dm_text=f"🟡 Подтвердите закрытие: {CHOICES[action]}.")
+        if action in CLOSING:
+            who = MANAGERS.get(job["manager"], "менеджер")
+            self.dm(f"closed:{job['id']}:{job['version']}", self.leader,
+                    f"✅ {who} закрыл заявку: {CHOICES[action]}.\n{self.short(job)}"
+                    + (f"\nЗапчасти: {job['parts']}" if job["parts"] else "")
+                    + (f"\nКомментарий: {job['comment']}" if job["comment"] else ""),
+                    job["id"], rows=[[["Открыть", f"open:{job['id']}"],
+                                      ["↩️ Вернуть в работу", f"reopen:{job['id']}:{job['version']}"]]])
 
     async def callback(self, callback, bot):
         async with self.lock:
@@ -847,16 +863,21 @@ class Parts:
             await cb.answer()
             await self.show(bot, chat, job, role)
             return
-        if int(args[2]) != job["version"] or job["status"] == "closed":
+        if int(args[2]) != job["version"] or (job["status"] == "closed" and action != "reopen"):
             await cb.answer("Карточка изменилась. Откройте её заново.", show_alert=True)
             return
-        if action in ("approve", "reject"):
-            if role != "leader" or job["status"] != "approval":
-                await cb.answer("Решение принимает руководитель.", show_alert=True)
+        if action in ("approve", "reject", "reopen"):
+            if role != "leader" or job["status"] != ("closed" if action == "reopen" else "approval"):
+                await cb.answer("Решение принимает руководитель." if role != "leader" else "Заявка уже изменилась.",
+                                show_alert=True)
                 return
+            if action == "reopen":
+                action = "reject"
             job["status"] = "closed" if action == "approve" else "new"
+            if action == "approve":
+                job["closed_at"] = now().isoformat()
             if action == "reject":
-                job.update(due=deadline(now()).isoformat(), request=None)
+                job.update(due=deadline(now()).isoformat(), request=None, closed_at=None)
             job["version"] += 1
             self.audit(cb.from_user.id, action, job)
             self.publish(job)
@@ -947,16 +968,15 @@ class Parts:
             if "dm:" + key in self.data["outbox"]:
                 continue
             leader = name == self.leader
-            mine = active if leader else [j for j in active if j["manager"] == name]
+            mine = active if leader else [j for j in active if j["manager"] == name and j["status"] != "approval"]
             inbox = sum(1 for ev in self.data["events"].values() if ev["pending"]) if leader else 0
             if not mine and not inbox:
                 continue
             late = {j["id"] for j in mine if datetime.fromisoformat(j["due"]) < current}
             text = (f"☀️ Доброе утро! {'Все заявки' if leader else 'Ваши заявки'} по запчастям: "
                     f"{len(mine)} в работе, просрочено {len(late)}.")
-            if leader:
-                waiting = sum(1 for j in mine if j["status"] == "approval")
-                text += f"\nЖдут вашего подтверждения: {waiting}. Требуют уточнения: {inbox}."
+            if leader and inbox:
+                text += f"\nТребуют уточнения: {inbox}."
             order = sorted(mine, key=lambda j: (j["id"] not in late, j["due"]))[:10]
             rows = [[[("⏰ " if j["id"] in late else "") + f"№{j['id']} {j['plate']} — {STATUS[j['status']]}",
                       f"open:{j['id']}"]] for j in order]
