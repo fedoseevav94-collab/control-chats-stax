@@ -21,8 +21,8 @@ def make_bot():
     return NS(send_message=AsyncMock(return_value=NS(message_id=777)), edit_message_text=AsyncMock())
 
 
-def group_calls(bot, chat=-10):
-    return [c for c in bot.send_message.call_args_list if c.args[0] == chat]
+def group_calls(bot, chat=-10, unclear=False):
+    return [c for c in bot.send_message.call_args_list if c.args[0] == chat and (unclear or not c.args[1].startswith("❓"))]
 
 
 def user(uid, name=None):
@@ -110,7 +110,8 @@ def test_partial_persistence_and_reminders(tmp_path):
         sent = len(group_calls(bot))
         await p.tick(bot, datetime(2026, 11, 25, 11, 1, tzinfo=TZ))
         assert len(group_calls(bot)) == sent
-        assert any("@fedos_av" in str(c) for c in bot.send_message.call_args_list)
+        assert any("@lalalas19" in c.args[1] for c in group_calls(bot))  # просрочка — менеджеру
+        assert all("@fedos_av" not in c.args[1] for c in group_calls(bot))  # руководителя в группе не дёргаем
         assert all("@dislavsergeevich" not in str(c) for c in bot.send_message.call_args_list)
         p.db.close()
         p = make(tmp_path)
@@ -419,5 +420,35 @@ def test_group_migrated_to_supergroup(tmp_path):
                    from_user=None, message_id=5)
         await p.message(moved, bot)
         assert p.data["source"] == -100888
+        p.db.close()
+    asyncio.run(run())
+
+
+def test_managers_handle_everything_without_leader(tmp_path):
+    async def run():
+        p, bot = make(tmp_path), make_bot()
+        p.username = "bot"
+        # 1) машины нет в справочнике — заявка видна всем менеджерам, берёт тот, кто действует
+        j = p.new_job("А111АА77", "source")
+        assert j["manager"] is None
+        assert "dm:new:1:pagorodu" in p.data["outbox"] and "dm:new:1:lalalas19" in p.data["outbox"]  # всем, кто нажал /start
+        await p.callback(callback(3, "list:0"), bot)
+        labels = [b.text for row in bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard for b in row]
+        assert any(label.startswith("№1 ") for label in labels)  # в «Мои заявки» у Армана
+        await p.callback(callback(3, "state:1:0:order"), bot)
+        assert j["manager"] == "pagorodu"
+        # 2) непонятное сообщение — в группу заказа с отметкой менеджеров, разбирает менеджер
+        await p.ingest(message(50, "ДТП, номер скину позже", photo=True))
+        unclear = p.data["outbox"]["unclear:-10020:50"]
+        assert unclear["chat"] is None and "@pagorodu" in unclear["text"] and "fedos_av" not in unclear["text"]
+        await p.callback(callback(2, "inbox:0"), bot)
+        eid = list(p.data["events"]).index("-10020:50")
+        await p.callback(callback(2, f"resolve:{eid}:plate:0"), bot)
+        await p.message(NS(chat=NS(id=2, type="private"), from_user=user(2), text="В326СВ761", answer=AsyncMock()), bot)
+        assert p.data["events"]["-10020:50"]["pending"] == ["В326СВ761"]
+        await p.callback(callback(2, f"resolve:{eid}:new:1"), bot)
+        assert any(x["plate"] == "В326СВ761" and x["manager"] == "lalalas19" for x in p.data["jobs"].values())
+        await p.tick(bot, datetime(2026, 11, 25, 9, 0, tzinfo=TZ))
+        assert all("@fedos_av" not in c.args[1] for c in group_calls(bot, unclear=True))
         p.db.close()
     asyncio.run(run())

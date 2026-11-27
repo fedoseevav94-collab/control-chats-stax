@@ -224,7 +224,7 @@ class Parts:
 
     def owns(self, job, role):
         # Списки «Мои заявки» / «Просроченные»: менеджеру — только закреплённые за ним.
-        return role == "leader" or (role in MANAGERS and job["manager"] == role)
+        return role == "leader" or (role in MANAGERS and job["manager"] in (role, None))
 
     def take_over(self, job, role, actor):
         """Менеджер выбрал действие в чужой заявке — закрепляем заявку за ним."""
@@ -263,14 +263,14 @@ class Parts:
         if dm_to:
             self.dm(key, dm_to, (dm_text or text) + "\n" + self.short(job), job["id"])
 
+    def tags(self):
+        return " ".join("@" + m for m in MANAGERS)
+
     def unclear(self, key, event):
-        text = ("❓ Нужно уточнить сообщение из группы ДТП: " + ", ".join(event["pending"])
-                + "\nОткройте в боте «Требуют уточнения».\n" + event["link"])
-        if self.data["leader_id"]:
-            self.enqueue("unclear:" + key, text, chat=self.data["leader_id"], kind="dm",
-                         rows=[[["Требуют уточнения", "inbox:0"]]])
-        else:
-            self.enqueue("unclear:" + key, f"@{self.leader}, " + text)
+        """Сообщение, которое бот не смог разобрать сам, — менеджерам в группу заказа, разбирают в боте."""
+        what = "номер не найден" if event["pending"] == ["?"] else f"{', '.join(event['pending'])}: новое ДТП или дополнение?"
+        self.enqueue("unclear:" + key, f"❓ {self.tags()}, нужно разобрать сообщение из группы ДТП ({what}).\n"
+                     + event["link"], url=["Разобрать в боте", f"https://t.me/{self.username}?start=parts_inbox"])
 
     def card(self, job):
         manager = "@" + job["manager"] if job["manager"] else "не определён"
@@ -298,7 +298,7 @@ class Parts:
         if link:
             text += "\nИсточник: " + link
         if not job["manager"] and job["status"] != "closed":
-            text += f"\n\n@{self.leader}, определите менеджера."
+            text += f"\n\nМенеджер не определён. {self.tags()}, кто возьмёт? Откройте заявку и выберите действие."
         return text + "\n\nОбновлено: " + now().strftime("%d.%m %H:%M")
 
     def publish(self, job, message=None):
@@ -321,6 +321,10 @@ class Parts:
         self.publish(job)
         if job["manager"]:
             self.dm(f"new:{jid}", job["manager"], "🚨 Новая заявка на вас: проверьте заказ запчастей.\n" + self.short(job), jid)
+        else:
+            for manager in MANAGERS:
+                self.dm(f"new:{jid}:{manager}", manager, "🚨 Новая заявка без менеджера — машины нет в справочнике. "
+                        "Возьмите её, если машина ваша.\n" + self.short(job), jid)
         return job
 
     async def show(self, bot, chat, job, role):
@@ -350,6 +354,34 @@ class Parts:
                      + ". Если выберете действие, она перейдёт к вам.")
         await bot.send_message(chat, text, reply_markup=keyboard(rows))
 
+    async def inbox(self, bot, chat, offset, role):
+        """«Требуют уточнения» — общая очередь, разбирает любой менеджер (и руководитель)."""
+        entries = [(key, ev) for key, ev in self.data["events"].items() if ev["pending"]]
+        home = "home:main" if role == "leader" else "home:parts"
+        if offset >= len(entries):
+            await bot.send_message(chat, "Нет сообщений для уточнения.", reply_markup=keyboard([[("🏠 Меню", home)]]))
+            return
+        key, event = entries[offset]
+        plate = event["pending"][0]
+        # Compact event index instead of potentially long chat/message key in callback data.
+        eid = list(self.data["events"]).index(key)
+        token = len(event.get("done", []))
+        rows = [[("Указать госномер", f"resolve:{eid}:plate:{token}")]] if plate == "?" else [[("Это новое ДТП", f"resolve:{eid}:new:{token}")]]
+        if plate != "?":
+            matches = [j for j in self.data["jobs"].values() if j["plate"] == plate]
+            rows += [[(f"Дополнить №{j['id']} ({j['date'] or 'дата неизвестна'})", f"resolve:{eid}:{j['id']}:{token}")] for j in matches[-8:]]
+        rows.append([("Не относится к заказу запчастей", f"resolve:{eid}:ignore:{token}")])
+        nav = []
+        if offset:
+            nav.append(("⬅️ Предыдущее", f"inbox:{offset - 1}"))
+        if offset + 1 < len(entries):
+            nav.append(("Следующее ➡️", f"inbox:{offset + 1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("🏠 Меню", home)])
+        head = f"Уточнение {offset + 1} из {len(entries)}: " + ("номер не найден" if plate == "?" else plate)
+        await bot.send_message(chat, f"{head}\n{event['text']}\n{event['link']}", reply_markup=keyboard(rows))
+
     async def menu(self, bot, chat, role):
         if role == "leader":
             # Руководитель управляет двумя разделами: запчасти и контроль чатов.
@@ -360,8 +392,9 @@ class Parts:
 
     async def parts_menu(self, bot, chat, role):
         rows = [[("Все заявки" if role == "leader" else "Мои заявки", "list:0")], [("Просроченные", "overdue:0")]]
+        waiting = sum(1 for ev in self.data["events"].values() if ev["pending"])
+        rows.append([("Требуют уточнения" + (f" ({waiting})" if waiting else ""), "inbox:0")])
         if role == "leader":
-            rows.append([("Требуют уточнения", "inbox:0")])
             rows.append([("⬅️ Главное меню", "home:main")])
         await bot.send_message(chat, "🚗 Контроль запчастей", reply_markup=keyboard(rows))
 
@@ -442,7 +475,7 @@ class Parts:
                 jobs = [j for j in self.data["jobs"].values() if j["plate"] == plate]
                 job = jobs[-1] if jobs else None
                 manager = (job or self.fleet.get(plate, {})).get("manager")
-                tag = "@" + (manager or self.leader)
+                tag = "@" + manager if manager else self.tags()
                 body = (f"{plate}: осмотрен, можно брать в ремонт.\n"
                         + ("Статус заказа: " + STATUS[job["status"]] if job else "Заявки на запчасти нет — проверьте заказ.")
                         + "\n" + event["link"])
@@ -577,7 +610,9 @@ class Parts:
                              [("stats", "Статистика чатов"), ("settings", "Настройки чатов"), ("fines", "Отчёт по штрафам")]]
             await bot.set_my_commands(commands, scope=BotCommandScopeChat(chat_id=message.chat.id))
             match = re.fullmatch(r"/start(?:@\w+)? parts_(\d+)", text)
-            if match and match[1] in self.data["jobs"]:
+            if re.fullmatch(r"/start(?:@\w+)? parts_inbox", text):
+                await self.inbox(bot, message.chat.id, 0, role)
+            elif match and match[1] in self.data["jobs"]:
                 await self.show(bot, message.chat.id, self.data["jobs"][match[1]], role)
             else:
                 await self.menu(bot, message.chat.id, role)
@@ -596,8 +631,6 @@ class Parts:
             await message.answer("Пришлите текст до 1200 символов. /start — отмена.")
             return
         if session.get("step") == "plate":
-            if role != "leader":
-                return
             plate = normalize(text)
             if not plates(plate, self.fleet):
                 await message.answer("Не удалось распознать госномер.")
@@ -607,7 +640,9 @@ class Parts:
             event.setdefault("done", []).append("number clarified")
             self.data["sessions"].pop(str(message.from_user.id))
             self.save()
-            await message.answer("Номер уточнён. Откройте «Требуют уточнения» для выбора ДТП.")
+            entries = [k for k, ev in self.data["events"].items() if ev["pending"]]
+            await message.answer(f"Номер {plate} записан.")
+            await self.inbox(bot, message.chat.id, entries.index(session["event"]) if session["event"] in entries else 0, role)
             return
         job = self.data["jobs"][session["job"]]
         if not self.access(job, role) or session["version"] != job["version"] or job["status"] in ("closed", "approval"):
@@ -824,29 +859,11 @@ class Parts:
             title = "Просроченные заявки" if action == "overdue" else ("Все заявки" if role == "leader" else "Мои заявки")
             await bot.send_message(chat, title if jobs else "Активных заявок нет.", reply_markup=keyboard(rows))
             return
-        if action == "inbox" and role == "leader":
-            entries = [(key, ev) for key, ev in self.data["events"].items() if ev["pending"]]
-            offset = int(args[1])
+        if action == "inbox":
             await cb.answer()
-            if offset >= len(entries):
-                await bot.send_message(chat, "Нет сообщений для уточнения.", reply_markup=keyboard([[("🏠 Меню", "home:main")]]))
-                return
-            key, event = entries[offset]
-            plate = event["pending"][0]
-            # Compact event index instead of potentially long chat/message key in callback data.
-            eid = list(self.data["events"]).index(key)
-            token = len(event.get("done", []))
-            rows = [[("Указать госномер", f"resolve:{eid}:plate:{token}")]] if plate == "?" else [[("Это новое ДТП", f"resolve:{eid}:new:{token}")]]
-            if plate != "?":
-                matches = [j for j in self.data["jobs"].values() if j["plate"] == plate]
-                rows += [[(f"Дополнить №{j['id']} ({j['date'] or 'дата неизвестна'})", f"resolve:{eid}:{j['id']}:{token}")] for j in matches[-8:]]
-            rows.append([("Не относится к контролю", f"resolve:{eid}:ignore:{token}")])
-            if offset + 1 < len(entries):
-                rows.append([("Следующее сообщение", f"inbox:{offset + 1}")])
-            rows.append([("🏠 Меню", "home:main")])
-            await bot.send_message(chat, f"Уточнение: {plate}\n{event['text']}\n{event['link']}", reply_markup=keyboard(rows))
+            await self.inbox(bot, chat, int(args[1]), role)
             return
-        if action == "resolve" and role == "leader":
+        if action == "resolve":
             key = list(self.data["events"])[int(args[1])]
             event = self.data["events"][key]
             if not event["pending"] or int(args[3]) != len(event.get("done", [])):
@@ -857,10 +874,14 @@ class Parts:
                 self.data["sessions"][str(cb.from_user.id)] = {"step": "plate", "event": key}
                 self.save()
                 await cb.answer()
-                await bot.send_message(chat, "Введите госномер. /start — отмена.")
+                await bot.send_message(chat, "Введите госномер машины из этого сообщения. /start — отмена.")
                 return
             if choice == "new" and plate != "?":
-                self.new_job(plate, key, event["date"])
+                job = self.new_job(plate, key, event["date"])
+                if not job["manager"] and role in MANAGERS:
+                    job["manager"] = role  # машины нет в справочнике — заявку берёт тот, кто разобрал
+                    job["version"] += 1
+                    self.publish(job)
             elif choice != "ignore":
                 job = self.data["jobs"][choice]
                 if job["plate"] != plate:
@@ -872,6 +893,8 @@ class Parts:
             self.audit(cb.from_user.id, "resolve " + choice)
             self.save()
             await cb.answer("Сохранено.")
+            await bot.send_message(chat, "✅ Готово.")
+            await self.inbox(bot, chat, 0, role)
             return
         job = self.data["jobs"][args[1]]
         if not self.access(job, role):
@@ -964,8 +987,8 @@ class Parts:
                 continue
             due = datetime.fromisoformat(job["due"]).strftime("%d.%m %H:%M")
             approval = job["status"] == "approval"
-            who = "" if approval else ("@" + job["manager"] if job["manager"] else "")
-            self.enqueue(key, f"⏰ Просрочено. @{self.leader} {who}\n{self.short(job)}\n"
+            who = f"@{self.leader}" if approval else ("@" + job["manager"] if job["manager"] else self.tags())
+            self.enqueue(key, f"⏰ Просрочено. {who}\n{self.short(job)}\n"
                               f"Статус: {STATUS[job['status']]}, срок был {due} МСК", job["id"])
             if approval:
                 self.dm(key, self.leader, f"⏰ Ждёт вашего подтверждения с {due}.\n{self.short(job)}", job["id"])
@@ -986,15 +1009,15 @@ class Parts:
             if "dm:" + key in self.data["outbox"]:
                 continue
             leader = name == self.leader
-            mine = active if leader else [j for j in active if j["manager"] == name and j["status"] != "approval"]
-            inbox = sum(1 for ev in self.data["events"].values() if ev["pending"]) if leader else 0
+            mine = active if leader else [j for j in active if j["manager"] in (name, None) and j["status"] != "approval"]
+            inbox = sum(1 for ev in self.data["events"].values() if ev["pending"])
             if not mine and not inbox:
                 continue
             late = {j["id"] for j in mine if datetime.fromisoformat(j["due"]) < current}
             text = (f"☀️ Доброе утро! {'Все заявки' if leader else 'Ваши заявки'} по запчастям: "
                     f"{len(mine)} в работе, просрочено {len(late)}.")
-            if leader and inbox:
-                text += f"\nТребуют уточнения: {inbox}."
+            if inbox:
+                text += f"\nТребуют уточнения (общая очередь): {inbox}."
             order = sorted(mine, key=lambda j: (j["id"] not in late, j["due"]))[:10]
             rows = [[[("⏰ " if j["id"] in late else "") + f"№{j['id']} {j['plate']} — {STATUS[j['status']]}",
                       f"open:{j['id']}"]] for j in order]
@@ -1029,7 +1052,10 @@ class Parts:
                     item["sent"] = True  # сигнал по уже закрытой заявке не нужен
                     self.save()
                     continue
-                markup = keyboard(item["rows"]) if item.get("rows") else (self.link(item["job"]) if item.get("job") else None)
+                if item.get("url"):
+                    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=item["url"][0], url=item["url"][1])]])
+                else:
+                    markup = keyboard(item["rows"]) if item.get("rows") else (self.link(item["job"]) if item.get("job") else None)
                 try:
                     if kind == "edit":
                         if not job.get("card"):
